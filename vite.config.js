@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   // GitHub Pages serves project sites at /REPO_NAME/.
   // Override with VITE_BASE_PATH=/ for a custom domain or user/org site.
-  base: process.env.VITE_BASE_PATH ?? '/VAMP/',
+  base: '/VAMP/',
   server: {
     port: 3000,
     open: true,
