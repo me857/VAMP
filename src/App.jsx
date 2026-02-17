@@ -148,6 +148,48 @@ export default function App() {
     setParsedWarnings(warnings);
   }, []);
 
+  /**
+   * Called by UploadSection's "Update VAMP Dashboard Now" button.
+   *
+   * Accepts the freshly-parsed data object directly so we compute results
+   * without touching the (potentially stale) txnData state.  We still update
+   * txnData so the form fields reflect the parsed values if the user scrolls
+   * back to the data-entry view.
+   */
+  const handleRunDashboard = useCallback((parsedData, warnings) => {
+    // 1. Merge parsed values into form state (for display/editing)
+    const merged = {
+      ...txnData,
+      totalSalesCount:  parsedData.totalSalesCount  || txnData.totalSalesCount  || 0,
+      totalSalesVolume: parsedData.totalSalesVolume || txnData.totalSalesVolume || 0,
+      cnpTxnCount:      parsedData.cnpTxnCount      || txnData.cnpTxnCount      || 0,
+      tc15Count:        parsedData.tc15Count         || txnData.tc15Count        || 0,
+      tc40Count:        parsedData.tc40Count         || txnData.tc40Count        || 0,
+      fraudAmountUSD:   parsedData.fraudAmountUSD    || txnData.fraudAmountUSD   || 0,
+    };
+    setTxnData(merged);
+    if (warnings?.length) setParsedWarnings(warnings);
+
+    // 2. Compute results synchronously from the fresh merged object
+    //    (bypasses React's batched state — txnData is stale here).
+    const tc40     = Number(merged.tc40Count)     || 0;
+    const tc15     = Number(merged.tc15Count)      || 0;
+    const cnp      = Number(merged.cnpTxnCount)    || 0;
+    const tot      = Number(merged.totalSalesCount) || cnp;
+    const fraudAmt = Number(merged.fraudAmountUSD)  || 0;
+
+    const vampResult = analyzeVAMP({ tc40Count: tc40, tc15Count: tc15, cnpTxnCount: cnp, acquirerId: merchant.acquirerId });
+    const ecpResult  = cnp > 0 && tc15 > 0 ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp }) : null;
+    const efmResult  = cnp > 0 && (tc40 > 0 || fraudAmt > 0) ? calculateEFM({ fraudCount: tc40, cnpTxnCount: cnp, fraudAmountUSD: fraudAmt }) : null;
+
+    const scoringChecklist = Object.fromEntries(Object.entries(checklist).map(([k, v]) => [k, v === true]));
+    const bankability = calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist: scoringChecklist });
+
+    // 3. Commit results and navigate immediately
+    setResults({ vampResult, ecpResult, efmResult, bankability });
+    setView('dashboard');
+  }, [txnData, merchant.acquirerId, checklist]);
+
   /** Run all calculations and move to the dashboard. */
   const runAnalysis = useCallback(() => {
     const tc40 = Number(txnData.tc40Count) || 0;
@@ -244,7 +286,7 @@ export default function App() {
             <div className="card p-6">
               <UploadSection
                 onParsed={handleParsed}
-                onManualEntry={() => {}}
+                onRunDashboard={handleRunDashboard}
               />
             </div>
 
