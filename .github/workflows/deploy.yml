@@ -1,0 +1,75 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main          # Deploy on every push to main
+  workflow_dispatch:  # Allow manual trigger from the Actions tab
+
+# Grant the GITHUB_TOKEN the permissions required by deploy-pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; cancel any in-progress run
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Build ──────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Node.js (LTS)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'          # Cache npm deps between runs for speed
+
+      # 3. Install dependencies (clean install, respects package-lock.json)
+      - name: Install dependencies
+        run: npm ci
+
+      # 4. Build the Vite project (outputs to ./dist)
+      - name: Build project
+        run: npm run build
+        env:
+          # If your repo is NOT at the root (e.g. https://user.github.io/VAMP/),
+          # set BASE_URL to /VAMP/ and update vite.config.js accordingly.
+          # Leave blank for a custom domain or user/org site (https://user.github.io/).
+          NODE_ENV: production
+
+      # 5. Configure GitHub Pages (sets up the Pages environment metadata)
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      # 6. Upload the dist folder as a Pages artifact
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist   # Vite's default output directory
+
+  # ── Job 2: Deploy ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: build          # Only runs after a successful build
+    runs-on: ubuntu-latest
+
+    # Required for the deploy-pages action
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
