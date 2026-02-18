@@ -8,8 +8,9 @@ import { parseStatements, generateCSVTemplate } from '../utils/statementParser.j
 // ── File entry summary pill ───────────────────────────────────────────────
 
 function FileEntry({ entry, onRemove }) {
-  const isError = Boolean(entry.error && !entry.isPDF);
-  const isPDF   = entry.isPDF;
+  const isError      = Boolean(entry.error && !entry.isPDF);
+  const isPDF        = entry.isPDF;             // PDF that could NOT be auto-parsed
+  const isPDFParsed  = Boolean(entry.isPDFExtracted && !entry.isPDF); // PDF successfully parsed
 
   return (
     <div className={`
@@ -28,8 +29,13 @@ function FileEntry({ entry, onRemove }) {
       </div>
 
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5 mb-0.5">
+        <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
           <span className="font-medium text-slate-200 truncate">{entry.filename}</span>
+          {isPDFParsed && (
+            <span className="flex-shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-purple-900/40 text-purple-300 border border-purple-700/50 rounded-full">
+              PDF parsed
+            </span>
+          )}
           {entry.month && (
             <span className="flex-shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-blue-900/40 text-blue-300 border border-blue-700/50 rounded-full">
               <Calendar size={9} />
@@ -39,7 +45,7 @@ function FileEntry({ entry, onRemove }) {
         </div>
 
         {isPDF ? (
-          <p className="text-amber-300/80">PDF detected — enter figures manually below.</p>
+          <p className="text-amber-300/80">PDF could not be auto-parsed — enter figures manually below.</p>
         ) : isError ? (
           <p className="text-red-300/80">{entry.error}</p>
         ) : (

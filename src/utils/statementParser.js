@@ -1,20 +1,313 @@
 /**
- * Statement Parser — CSV Extraction Engine (v2)
+ * Statement Parser — CSV + PDF Extraction Engine (v3)
  *
- * Improvements over v1:
- *  • Null vs. Zero distinction: keyword found but value = 0 → records 0 (not "Not Found").
- *    A missing column → records null and emits a warning.
- *  • Month detection: `detectMonthFromFilename(filename)` scans the filename
- *    for a recognisable month/year pattern.
- *  • Multi-file: `parseStatements(files[])` returns an array of monthly data objects
- *    sorted chronologically, each with a computed VAMP ratio.
+ *  • CSV:  column-alias detection + null-vs-zero distinction.
+ *  • PDF:  real text extraction via pdfjs-dist (browser-native, no server upload).
+ *          First Data / ServeFirst statement rules:
+ *            Gross Volume   → "Total Amount Submitted" (page 1 summary)
+ *            Sales Count    → "Items" column in Summary By Card Type table
+ *            Chargeback Cnt → 0 when "No Chargebacks/Reversals" phrase found;
+ *                             never forces manual entry for this field
+ *            Fraud Count    → always 0 (field absent in First Data statements)
  *
- * Privacy-first: all parsing is done client-side. No data is uploaded
- * to any server. Files are read via the browser's FileReader API and
- * discarded from memory after extraction.
+ * Privacy-first: all parsing is 100% client-side via FileReader / pdfjs Web Worker.
+ * No data is uploaded or stored on any server.
  */
 
 import Papa from 'papaparse';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PDF EXTRACTION ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Use pdfjs-dist to extract all text lines from every page of a PDF.
+ * Lines are reconstructed by grouping text items with similar y-coordinates
+ * (within 3pt tolerance) and sorting left-to-right within each group.
+ *
+ * @param {File} file
+ * @returns {Promise<string[]>} All lines from all pages, top-to-bottom.
+ */
+async function extractPDFLines(file) {
+  // Dynamic import keeps the 1.4 MB worker out of the initial bundle
+  const pdfjs = await import('pdfjs-dist');
+  const { default: workerUrl } = await import('pdfjs-dist/build/pdf.worker.min.mjs?url');
+
+  // Only set the worker once
+  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+    pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+
+  const allLines = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const textContent = await page.getTextContent();
+
+    if (!textContent.items.length) continue;
+
+    // Build position-annotated items; skip whitespace-only strings
+    const items = textContent.items
+      .filter((it) => it.str?.trim())
+      .map((it) => ({ x: it.transform[4], y: it.transform[5], text: it.str }))
+      // Sort top-to-bottom (y desc in PDF space) then left-to-right
+      .sort((a, b) => b.y - a.y || a.x - b.x);
+
+    // Tolerance-based line grouping: start a new group when y jumps > 3pt
+    const groups = [];
+    let cur = null;
+    for (const it of items) {
+      if (!cur || Math.abs(it.y - cur.y) > 3) {
+        cur = { y: it.y, items: [it] };
+        groups.push(cur);
+      } else {
+        cur.items.push(it);
+      }
+    }
+
+    // Sort each group left-to-right and join into a line string
+    for (const g of groups) {
+      g.items.sort((a, b) => a.x - b.x);
+      const line = g.items.map((i) => i.text).join(' ').replace(/\s{2,}/g, ' ').trim();
+      if (line) allLines.push(line);
+    }
+  }
+
+  return allLines;
+}
+
+// ── Field-extraction helpers ──────────────────────────────────────────────
+
+/**
+ * Extract the first pure integer (no decimal point) from a line, left to right.
+ * Handles comma-separated numbers like "1,234".
+ * Returns null if nothing found.
+ */
+function firstInt(line) {
+  const parts = line.split(/\s+/);
+  for (const p of parts) {
+    const clean = p.replace(/[$,()]/g, '');
+    if (/^\d{1,8}$/.test(clean)) return parseInt(clean, 10);
+  }
+  return null;
+}
+
+/**
+ * Extract the first dollar/decimal amount from a line (e.g. "$269,742.10").
+ * Returns null if none found.
+ */
+function firstDollar(line) {
+  const m = line.match(/\$?\s*([\d,]+\.\d{2})/);
+  if (!m) return null;
+  const n = parseFloat(m[1].replace(/,/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+// ── First Data / ServeFirst field extraction ──────────────────────────────
+
+// Phrase variants that mean "Total Amount Submitted"
+const GROSS_LABELS = [
+  'total amount submitted',
+  'total gross sales you submitted',
+  'gross sales you submitted',
+  'total sales submitted',
+  'total submitted',
+];
+
+// Phrase variants that mean "zero chargebacks this period"
+const NO_CB_PHRASES = [
+  'no chargebacks/reversals for this statement period',
+  'no chargeback/reversal for this statement period',
+  'no chargebacks for this statement period',
+  'no chargebacks',
+];
+
+// Card-type names that appear at the start of Summary By Card Type rows
+const CARD_TYPE_PREFIXES = [
+  'visa', 'mastercard', 'master card', 'mc ', 'discover', 'american express',
+  'amex', 'jcb', 'diners', 'debit', 'pin debit', 'fleet', 'voyager',
+  'wright express', 'wex', 'check', 'ach',
+];
+
+/**
+ * Parse extracted PDF lines using First Data / ServeFirst statement rules.
+ *
+ * Field rules (per product spec):
+ *  • Gross Volume   "Total Amount Submitted" — inline or adjacent line
+ *  • Sales Count    Sum of "Items" column in Summary By Card Type (excl. Adjustments)
+ *                   Uses the Total row when present (more reliable).
+ *  • Chargeback Cnt = 0 when "No Chargebacks/Reversals" phrase detected OR when the
+ *                   page-1 summary shows Chargebacks/Reversals = $0.00. Never null.
+ *  • Fraud Count    Always 0 (not present in First Data statements).
+ *
+ * @param {string[]} lines
+ * @returns {{ data: object, warnings: string[], detectedFields: object }}
+ */
+function parseFirstDataFields(lines) {
+  const warnings  = [];
+  let grossVolume     = null;
+  let salesCount      = null;
+  let chargebackCount = null;   // will always be resolved to a number before return
+  const fraudCount    = 0;      // constant — not in First Data statements
+
+  let inCardTypeSection = false;
+  let cardSectionItemSum = 0;
+  let cardSectionRowsFound = 0;
+  let cbSectionFound = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line  = lines[i];
+    const lower = line.toLowerCase().trim();
+
+    // ── 1. Gross Volume ────────────────────────────────────────────────
+    if (grossVolume === null && GROSS_LABELS.some((lbl) => lower.includes(lbl))) {
+      // Try inline (same line has a dollar amount)
+      let val = firstDollar(line);
+      if (val === null && i + 1 < lines.length) val = firstDollar(lines[i + 1]);
+      if (val === null && i + 2 < lines.length) val = firstDollar(lines[i + 2]);
+      if (val !== null && val > 0) grossVolume = val;
+    }
+
+    // ── 2. Chargeback Count — "No Chargebacks" phrase ─────────────────
+    if (chargebackCount === null && NO_CB_PHRASES.some((p) => lower.includes(p))) {
+      chargebackCount = 0;
+    }
+
+    // ── 3. Chargeback Count — page-1 summary "Chargebacks/Reversals $0.00" ──
+    if (chargebackCount === null &&
+        lower.includes('chargeback') && lower.includes('reversal')) {
+      cbSectionFound = true;
+      const dollar = firstDollar(line);
+      if (dollar === 0) {
+        chargebackCount = 0;
+      } else if (dollar === null) {
+        // Might be the section heading — look for a count integer
+        const cnt = firstInt(line);
+        if (cnt !== null) chargebackCount = cnt;
+      }
+      // If dollar > 0: there are chargebacks but we need the count from the detail section
+    }
+
+    // ── 4. Chargeback Count — from "Total Chargebacks N $X" row ───────
+    if (chargebackCount === null &&
+        lower.startsWith('total chargeback') && !lower.includes('amount')) {
+      const cnt = firstInt(line);
+      if (cnt !== null) chargebackCount = cnt;
+    }
+
+    // ── 5. Summary By Card Type section detection ──────────────────────
+    if (lower.includes('summary by card type') || lower.includes('card type summary')) {
+      inCardTypeSection = true;
+      // Reset partial sums for this section
+      cardSectionItemSum  = 0;
+      cardSectionRowsFound = 0;
+      salesCount = null;
+      continue;
+    }
+
+    // Detect end of card-type section (next major heading or page boundary)
+    if (inCardTypeSection) {
+      const isNewSection =
+        lower.includes('summary by day') ||
+        lower.includes('summary by batch') ||
+        lower.includes('adjustment detail') ||
+        lower.includes('fee detail') ||
+        lower.includes('chargeback detail') ||
+        (lower.startsWith('page ') && /page\s+\d+/i.test(lower));
+      if (isNewSection) { inCardTypeSection = false; }
+    }
+
+    if (!inCardTypeSection) continue;
+
+    // Skip column header rows and rows that are clearly dollar totals
+    if (lower.includes('items') || lower.includes('net amount') ||
+        lower.includes('submitted') || lower.includes('reversals')) continue;
+
+    // Adjustments row — explicitly excluded per spec
+    if (lower.startsWith('adjustment') || lower.includes('adjustment')) continue;
+
+    // ── "Total" row → definitive Items sum ────────────────────────────
+    if (/^\s*total\b/i.test(lower) &&
+        !lower.includes('amount') && !lower.includes('gross') && !lower.includes('submitted')) {
+      const cnt = firstInt(line);
+      if (cnt !== null && cnt > 0) {
+        salesCount = cnt;   // authoritative — stop counting individual rows
+        inCardTypeSection = false;
+        continue;
+      }
+    }
+
+    // ── Individual card-type row ───────────────────────────────────────
+    const startsWithCardType = CARD_TYPE_PREFIXES.some((ct) => lower.startsWith(ct));
+    if (startsWithCardType) {
+      const cnt = firstInt(line);
+      if (cnt !== null && cnt > 0) {
+        cardSectionItemSum  += cnt;
+        cardSectionRowsFound++;
+      }
+    }
+  }
+
+  // ── Post-loop resolution ───────────────────────────────────────────────
+
+  // Sales Count: use Total row result; fall back to summed card rows
+  if (salesCount === null && cardSectionRowsFound > 0) {
+    salesCount = cardSectionItemSum;
+  }
+
+  // Chargeback Count: never leave null — default to 0 with a warning if uncertain
+  if (chargebackCount === null) {
+    chargebackCount = 0;
+    if (cbSectionFound) {
+      warnings.push(
+        'Chargeback section found but count could not be extracted. Defaulted to 0 — please verify.'
+      );
+    } else {
+      warnings.push('Chargeback section not found in PDF. Defaulted to 0.');
+    }
+  }
+
+  // Missing field warnings (gross & count only — chargebacks always resolved)
+  if (grossVolume === null) {
+    warnings.push(
+      '"Total Amount Submitted" not found in PDF. Please enter Gross Volume manually.'
+    );
+  }
+  if (salesCount === null) {
+    warnings.push(
+      '"Summary By Card Type" Items column not found. Please enter Sales Count manually.'
+    );
+  }
+
+  const anyExtracted = grossVolume !== null || salesCount !== null;
+
+  return {
+    data: anyExtracted
+      ? {
+          totalSalesCount:  salesCount,
+          totalSalesVolume: grossVolume,
+          // Treat all items as CNP (First Data is predominantly CNP/e-commerce)
+          cnpTxnCount:      salesCount,
+          tc15Count:        chargebackCount,
+          tc40Count:        fraudCount,
+          fraudAmountUSD:   null,
+        }
+      : null,
+    warnings,
+    detectedFields: {
+      totalSalesVolume: grossVolume     !== null,
+      totalSalesCount:  salesCount      !== null,
+      cnpTxnCount:      salesCount      !== null,
+      tc15Count:        true,   // always resolved
+      tc40Count:        true,   // always 0
+      fraudAmountUSD:   false,
+    },
+    isPDFExtracted: true,
+  };
+}
 import { calculateMonthlyVAMP, formatMonthLabel } from './trendCalculator.js';
 
 // ── Column-name aliases ────────────────────────────────────────────────────
@@ -249,25 +542,66 @@ export function parseCSVStatement(file) {
 }
 
 /**
- * Attempt to extract data from a PDF file.
- * Phase 1: Returns a structured notice explaining OCR is pending.
+ * Extract field data from a PDF processing statement using pdfjs-dist.
+ *
+ * Supports First Data / ServeFirst statements natively:
+ *  • Gross Volume   → "Total Amount Submitted"
+ *  • Sales Count    → Items column in Summary By Card Type
+ *  • Chargeback Cnt → 0 when "No Chargebacks/Reversals" phrase detected; never null
+ *  • Fraud Count    → always 0 (not in First Data statements)
+ *
+ * For scanned/image-only PDFs (no embedded text), falls back to the
+ * manual-entry notice gracefully.
  *
  * @param {File} file
- * @returns {Promise<{ data: null, notice: string, requiresManualEntry: true }>}
+ * @returns {Promise<object>}
  */
 export async function parsePDFStatement(file) {
-  if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
-    throw new Error('File does not appear to be a PDF.');
+  try {
+    const lines = await extractPDFLines(file);
+
+    if (lines.length === 0) {
+      return {
+        data:               null,
+        requiresManualEntry: true,
+        warnings:           [],
+        detectedFields:     {},
+        notice:
+          'This PDF appears to contain scanned images rather than embedded text. ' +
+          'Please enter the key figures manually. Your file is not uploaded or stored.',
+        filename: file.name,
+        fileSize: file.size,
+      };
+    }
+
+    const result = parseFirstDataFields(lines);
+
+    return {
+      data:               result.data,
+      warnings:           result.warnings,
+      detectedFields:     result.detectedFields,
+      isPDFExtracted:     true,
+      // requiresManualEntry only when nothing at all could be extracted
+      requiresManualEntry: result.data === null,
+      notice: result.data === null
+        ? 'Some required fields could not be found automatically in this PDF. ' +
+          'Please enter them manually using the form below.'
+        : null,
+      filename: file.name,
+      fileSize: file.size,
+    };
+  } catch (err) {
+    // PDF.js load/parse failure (encrypted, corrupt, etc.)
+    return {
+      data:               null,
+      requiresManualEntry: true,
+      warnings:           [],
+      detectedFields:     {},
+      notice: `PDF could not be read: ${err.message}. Please enter figures manually.`,
+      filename: file.name,
+      fileSize: file.size,
+    };
   }
-  return {
-    data:               null,
-    requiresManualEntry: true,
-    notice:
-      'PDF parsing via OCR is planned for Phase 2. For now, please review the uploaded ' +
-      'PDF and enter the key figures manually in the form below. Your PDF is not uploaded or stored.',
-    filename: file.name,
-    fileSize: file.size,
-  };
 }
 
 /**
@@ -299,16 +633,19 @@ export async function parseStatements(files) {
       const monthInfo = detectMonthFromFilename(file.name);
 
       if (!res.data) {
-        // PDF or parse failure — return placeholder
+        // PDF with no extractable text, or unrecognised format → manual entry
         return {
-          filename:  file.name,
-          month:     monthInfo?.month ?? file.name,
-          year:      monthInfo?.year  ?? null,
+          filename:   file.name,
+          month:      monthInfo?.month ?? file.name,
+          year:       monthInfo?.year  ?? null,
           monthIndex: monthInfo?.monthIndex ?? null,
-          isPDF:     true,
-          data:      null,
-          warnings:  [],
-          error:     res.notice ?? 'Could not extract data from this file.',
+          // isPDFExtracted = true means pdfjs ran but got nothing useful;
+          // isPDF = true signals the UI to show the "enter manually" notice
+          isPDF:      true,
+          isPDFExtracted: Boolean(res.isPDFExtracted),
+          data:       null,
+          warnings:   res.warnings ?? [],
+          error:      res.notice ?? 'Could not extract data from this file.',
         };
       }
 
@@ -324,6 +661,7 @@ export async function parseStatements(files) {
         month:            monthInfo?.month ?? file.name,
         year:             monthInfo?.year  ?? null,
         monthIndex:       monthInfo?.monthIndex ?? null,
+        isPDFExtracted:   Boolean(res.isPDFExtracted),
         totalSalesCount:  data.totalSalesCount  ?? 0,
         totalSalesVolume: data.totalSalesVolume ?? 0,
         cnpTxnCount:      data.cnpTxnCount      ?? 0,
