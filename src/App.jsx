@@ -160,7 +160,7 @@ function runCalculators({ txnData, monthlyData, merchant, checklist }) {
 // ── Main App ──────────────────────────────────────────────────────────────
 
 export default function App() {
-  // views: landing | upload | checklist | gate | report
+  // views: landing | upload | checklist | dashboard | gate | report
   const [view,          setView]          = useState('landing');
   const [merchant,      setMerchant]      = useState(DEFAULT_MERCHANT);
   const [txnData,       setTxnData]       = useState(DEFAULT_TXN);
@@ -216,7 +216,7 @@ export default function App() {
 
     setTxnData(merged);
     setResults(computed);
-    setView('gate');
+    setView('dashboard');
   }, [merchant, checklist]);
 
   // ── Go to dashboard from checklist (manual flow) ──────────────────────
@@ -224,7 +224,7 @@ export default function App() {
   const handleGoToDashboard = useCallback(() => {
     const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
     setResults(computed);
-    setView('gate');
+    setView('dashboard');
   }, [txnData, monthlyData, merchant, checklist]);
 
   // ── Lead gate submit ──────────────────────────────────────────────────
@@ -243,8 +243,8 @@ export default function App() {
   // ── Navigation ────────────────────────────────────────────────────────
 
   const handleNavigate = useCallback((target) => {
-    if (target === 'gate' && results) {
-      // Re-run when navigating back from report
+    if ((target === 'dashboard' || target === 'gate') && results) {
+      // Re-run when navigating back from a later step
       const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
       setResults(computed);
     }
@@ -330,6 +330,21 @@ export default function App() {
           </div>
         )}
 
+        {/* ── Dashboard ── */}
+        {view === 'dashboard' && results && (
+          <div className="max-w-5xl mx-auto px-4 py-10 animate-slide-up">
+            <Dashboard
+              merchant={merchant}
+              txnData={txnData}
+              vampResult={results.vampResult}
+              ecpResult={results.ecpResult}
+              efmResult={results.efmResult}
+              bankability={results.bankability}
+              onNext={() => setView('gate')}
+            />
+          </div>
+        )}
+
         {/* ── Lead Gate ── */}
         {view === 'gate' && results && (
           <LeadGate
@@ -387,13 +402,13 @@ export default function App() {
               ecpResult={results.ecpResult}
               efmResult={results.efmResult}
               bankability={results.bankability}
-              onBack={() => setView('gate')}
+              onBack={() => setView('dashboard')}
             />
           </div>
         )}
 
-        {/* Fallback if gate/report state lost */}
-        {(view === 'gate' || view === 'report') && !results && (
+        {/* Fallback if dashboard/gate/report state lost */}
+        {(view === 'dashboard' || view === 'gate' || view === 'report') && !results && (
           <div className="flex flex-col items-center justify-center py-32 gap-4">
             <p className="text-slate-400">No analysis data found.</p>
             <button onClick={() => setView('upload')} className="btn-primary">
