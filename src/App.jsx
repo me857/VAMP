@@ -140,8 +140,9 @@ function runCalculators({ txnData, monthlyData, merchant, checklist }) {
     acquirerId:  merchant.acquirerId,
   });
 
-  const ecpResult = cnp > 0
-    ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp })
+  const ecpTxnCount = cnp || tot;
+  const ecpResult = ecpTxnCount > 0
+    ? calculateECP({ chargebackCount: tc15, totalTxnCount: ecpTxnCount })
     : null;
 
   const efmResult = cnp > 0 && (tc40 > 0 || fraudAmt > 0)
