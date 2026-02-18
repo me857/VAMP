@@ -23,6 +23,7 @@ export function calculateVAMP({ tc40Count = 0, tc15Count = 0, cnpTxnCount = 0 })
   if (cnpTxnCount <= 0) {
     return {
       ratio: 0,
+      vampRatio: 0,         // alias consumed by LeadGate, MentorAnalysis, TrendCharts
       percentage: '0.000',
       tc40Count,
       tc15Count,
@@ -80,6 +81,7 @@ export function calculateVAMP({ tc40Count = 0, tc15Count = 0, cnpTxnCount = 0 })
 
   return {
     ratio,
+    vampRatio: ratio,     // alias consumed by LeadGate, MentorAnalysis, TrendCharts
     percentage,
     tc40Count,
     tc15Count,
