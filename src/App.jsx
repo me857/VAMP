@@ -6,11 +6,16 @@ import MerchantForm from './components/MerchantForm.jsx';
 import WebsiteAuditor from './components/WebsiteAuditor.jsx';
 import Dashboard from './components/Dashboard.jsx';
 import RiskReport from './components/RiskReport.jsx';
+import LeadGate from './components/LeadGate.jsx';
+import MentorAnalysis from './components/MentorAnalysis.jsx';
+import { VolumeDisputesChart, VAMPGauge } from './components/TrendCharts.jsx';
 import { analyzeVAMP } from './utils/vampCalculator.js';
 import { calculateECP, calculateEFM } from './utils/ecpEfmCalculator.js';
 import { calculateBankabilityScore } from './utils/bankabilityScore.js';
+import { buildTrendSummary } from './utils/trendCalculator.js';
+import { sendLeadToWebhook } from './utils/leadCapture.js';
 
-// ── Default state ────────────────────────────────────────────────────────────
+// ── Default state ─────────────────────────────────────────────────────────
 
 const DEFAULT_MERCHANT = {
   businessName: '',
@@ -42,7 +47,7 @@ const DEFAULT_CHECKLIST = {
   hasPhysicalAddress:      null,
 };
 
-// ── Landing page ──────────────────────────────────────────────────────────────
+// ── Landing page ──────────────────────────────────────────────────────────
 
 function LandingHero({ onStart }) {
   return (
@@ -60,7 +65,8 @@ function LandingHero({ onStart }) {
 
       <p className="text-lg text-slate-400 mt-4 max-w-xl leading-relaxed">
         Instantly calculate Visa VAMP ratios, Mastercard ECP/EFM status, and generate a
-        full Risk Health Report — with acquirer-adjusted risk grading and remediation guidance.
+        full Risk Health Report — with trend charts, acquirer-adjusted risk grading, and
+        Mentor&apos;s Analysis.
       </p>
 
       {/* Feature pills */}
@@ -71,9 +77,13 @@ function LandingHero({ onStart }) {
           'Acquirer-Adjusted Grading',
           'Website Compliance Audit',
           'Bankability Score',
+          '3-Month Rolling Average',
+          'VAMP Threshold Gauge',
+          "Mentor's Analysis",
           'Printable Risk Report',
           'Privacy-First · No Data Stored',
           'CSV Auto-Parse',
+          'Multi-Month Trend Charts',
         ].map((tag) => (
           <span key={tag} className="px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-full text-xs text-slate-300">
             {tag}
@@ -95,10 +105,10 @@ function LandingHero({ onStart }) {
       {/* How it works */}
       <div className="mt-16 grid grid-cols-1 sm:grid-cols-4 gap-4 max-w-3xl w-full text-left">
         {[
-          { step: '1', title: 'Enter Data', desc: 'Upload a CSV statement or manually enter transaction figures.' },
-          { step: '2', title: 'Audit Website', desc: "Complete the dynamic compliance checklist for the merchant's site." },
-          { step: '3', title: 'View Dashboard', desc: 'See your VAMP ratio, traffic-light status, and bankability score.' },
-          { step: '4', title: 'Generate Report', desc: 'Print or save a professional Risk Health Report PDF.' },
+          { step: '1', title: 'Upload Statements', desc: 'Drop up to 3 months of CSV statements for trend analysis.' },
+          { step: '2', title: 'Audit Website',     desc: "Complete the dynamic compliance checklist for the merchant's site." },
+          { step: '3', title: 'Unlock Report',     desc: 'Enter your details to unlock the full Risk Health Report.' },
+          { step: '4', title: 'View & Print',      desc: 'See gauges, trend charts, and export a professional PDF.' },
         ].map((item) => (
           <div key={item.step} className="card-hover p-4">
             <div className="flex items-center justify-center w-7 h-7 rounded-full bg-blue-600 text-white text-xs font-bold mb-3">
@@ -113,140 +123,142 @@ function LandingHero({ onStart }) {
   );
 }
 
-// ── Main App ──────────────────────────────────────────────────────────────────
+// ── Helper: run all calculators synchronously from raw data ───────────────
+
+function runCalculators({ txnData, monthlyData, merchant, checklist }) {
+  const tc40     = Number(txnData.tc40Count)        || 0;
+  const tc15     = Number(txnData.tc15Count)        || 0;
+  const cnp      = Number(txnData.cnpTxnCount)      || 0;
+  const tot      = Number(txnData.totalSalesCount)  || cnp;
+  const fraudAmt = Number(txnData.fraudAmountUSD)   || 0;
+
+  const vampResult = analyzeVAMP({
+    tc40Count:   tc40,
+    tc15Count:   tc15,
+    cnpTxnCount: cnp,
+    acquirerId:  merchant.acquirerId,
+  });
+
+  const ecpResult = cnp > 0 && tc15 > 0
+    ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp })
+    : null;
+
+  const efmResult = cnp > 0 && (tc40 > 0 || fraudAmt > 0)
+    ? calculateEFM({ fraudCount: tc40, cnpTxnCount: cnp, fraudAmountUSD: fraudAmt })
+    : null;
+
+  const scoringChecklist = Object.fromEntries(
+    Object.entries(checklist).map(([k, v]) => [k, v === true])
+  );
+  const bankability = calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist: scoringChecklist });
+
+  const trendSummary = buildTrendSummary(monthlyData ?? []);
+
+  return { vampResult, ecpResult, efmResult, bankability, trendSummary };
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view, setView] = useState('landing'); // landing | upload | checklist | dashboard | report
-  const [merchant, setMerchant] = useState(DEFAULT_MERCHANT);
-  const [txnData, setTxnData] = useState(DEFAULT_TXN);
-  const [checklist, setChecklist] = useState(DEFAULT_CHECKLIST);
+  // views: landing | upload | checklist | gate | report
+  const [view,          setView]          = useState('landing');
+  const [merchant,      setMerchant]      = useState(DEFAULT_MERCHANT);
+  const [txnData,       setTxnData]       = useState(DEFAULT_TXN);
+  const [checklist,     setChecklist]     = useState(DEFAULT_CHECKLIST);
   const [parsedWarnings, setParsedWarnings] = useState([]);
-  const [results, setResults] = useState(null);
+  const [monthlyData,   setMonthlyData]   = useState([]); // array of parsed monthly objects
+  const [results,       setResults]       = useState(null);
+  const [lead,          setLead]          = useState(null);
 
-  const updateMerchant = useCallback((patch) => {
-    setMerchant((prev) => ({ ...prev, ...patch }));
-  }, []);
+  // ── State updaters ────────────────────────────────────────────────────
 
-  const updateTxnData = useCallback((patch) => {
-    setTxnData((prev) => ({ ...prev, ...patch }));
-  }, []);
+  const updateMerchant  = useCallback((patch) => setMerchant((p) => ({ ...p, ...patch })), []);
+  const updateTxnData   = useCallback((patch) => setTxnData((p) => ({ ...p, ...patch })), []);
+  const updateChecklist = useCallback((patch) => setChecklist((p) => ({ ...p, ...patch })), []);
 
-  const updateChecklist = useCallback((patch) => {
-    setChecklist((prev) => ({ ...prev, ...patch }));
-  }, []);
-
-  const handleParsed = useCallback((data, warnings) => {
+  // Called when UploadSection parses files — pre-fills the form with latest month
+  const handleParsed = useCallback((latestMonthData, warnings) => {
     setTxnData((prev) => ({
       ...prev,
-      totalSalesCount:  data.totalSalesCount  || prev.totalSalesCount,
-      totalSalesVolume: data.totalSalesVolume || prev.totalSalesVolume,
-      cnpTxnCount:      data.cnpTxnCount      || prev.cnpTxnCount,
-      tc15Count:        data.tc15Count         || prev.tc15Count,
-      tc40Count:        data.tc40Count         || prev.tc40Count,
-      fraudAmountUSD:   data.fraudAmountUSD    || prev.fraudAmountUSD,
+      totalSalesCount:  latestMonthData.totalSalesCount  ?? prev.totalSalesCount,
+      totalSalesVolume: latestMonthData.totalSalesVolume ?? prev.totalSalesVolume,
+      cnpTxnCount:      latestMonthData.cnpTxnCount      ?? prev.cnpTxnCount,
+      tc15Count:        latestMonthData.tc15Count         ?? prev.tc15Count,
+      tc40Count:        latestMonthData.tc40Count         ?? prev.tc40Count,
+      fraudAmountUSD:   latestMonthData.fraudAmountUSD   ?? prev.fraudAmountUSD,
     }));
     setParsedWarnings(warnings);
   }, []);
 
-  /**
-   * Called by UploadSection's "Update VAMP Dashboard Now" button.
-   *
-   * Accepts the freshly-parsed data object directly so we compute results
-   * without touching the (potentially stale) txnData state.  We still update
-   * txnData so the form fields reflect the parsed values if the user scrolls
-   * back to the data-entry view.
-   */
-  const handleRunDashboard = useCallback((parsedData, warnings) => {
-    // 1. Merge parsed values into form state (for display/editing)
+  // ── Submit from UploadSection (CSV files parsed, button clicked) ──────
+
+  const handleUploadSubmit = useCallback((csvMonths) => {
+    // Store all monthly data for trend charts
+    setMonthlyData(csvMonths);
+
+    // Use the most recent month's data to pre-fill form and run analysis
+    const latest = csvMonths[csvMonths.length - 1];
     const merged = {
-      ...txnData,
-      totalSalesCount:  parsedData.totalSalesCount  || txnData.totalSalesCount  || 0,
-      totalSalesVolume: parsedData.totalSalesVolume || txnData.totalSalesVolume || 0,
-      cnpTxnCount:      parsedData.cnpTxnCount      || txnData.cnpTxnCount      || 0,
-      tc15Count:        parsedData.tc15Count         || txnData.tc15Count        || 0,
-      tc40Count:        parsedData.tc40Count         || txnData.tc40Count        || 0,
-      fraudAmountUSD:   parsedData.fraudAmountUSD    || txnData.fraudAmountUSD   || 0,
+      totalSalesCount:  latest.totalSalesCount  ?? 0,
+      totalSalesVolume: latest.totalSalesVolume ?? 0,
+      cnpTxnCount:      latest.cnpTxnCount      ?? 0,
+      tc15Count:        latest.tc15Count         ?? 0,
+      tc40Count:        latest.tc40Count         ?? 0,
+      fraudAmountUSD:   latest.fraudAmountUSD   ?? 0,
     };
+
+    const computed = runCalculators({
+      txnData:     merged,
+      monthlyData: csvMonths,
+      merchant,
+      checklist,
+    });
+
     setTxnData(merged);
-    if (warnings?.length) setParsedWarnings(warnings);
+    setResults(computed);
+    setView('gate');
+  }, [merchant, checklist]);
 
-    // 2. Compute results synchronously from the fresh merged object
-    //    (bypasses React's batched state — txnData is stale here).
-    const tc40     = Number(merged.tc40Count)     || 0;
-    const tc15     = Number(merged.tc15Count)      || 0;
-    const cnp      = Number(merged.cnpTxnCount)    || 0;
-    const tot      = Number(merged.totalSalesCount) || cnp;
-    const fraudAmt = Number(merged.fraudAmountUSD)  || 0;
-
-    const vampResult = analyzeVAMP({ tc40Count: tc40, tc15Count: tc15, cnpTxnCount: cnp, acquirerId: merchant.acquirerId });
-    const ecpResult  = cnp > 0 && tc15 > 0 ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp }) : null;
-    const efmResult  = cnp > 0 && (tc40 > 0 || fraudAmt > 0) ? calculateEFM({ fraudCount: tc40, cnpTxnCount: cnp, fraudAmountUSD: fraudAmt }) : null;
-
-    const scoringChecklist = Object.fromEntries(Object.entries(checklist).map(([k, v]) => [k, v === true]));
-    const bankability = calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist: scoringChecklist });
-
-    // 3. Commit results and navigate immediately
-    setResults({ vampResult, ecpResult, efmResult, bankability });
-    setView('dashboard');
-  }, [txnData, merchant.acquirerId, checklist]);
-
-  /** Run all calculations and move to the dashboard. */
-  const runAnalysis = useCallback(() => {
-    const tc40 = Number(txnData.tc40Count) || 0;
-    const tc15 = Number(txnData.tc15Count) || 0;
-    const cnp  = Number(txnData.cnpTxnCount) || 0;
-    const tot  = Number(txnData.totalSalesCount) || cnp;
-    const fraudAmt = Number(txnData.fraudAmountUSD) || 0;
-
-    const vampResult = analyzeVAMP({
-      tc40Count:   tc40,
-      tc15Count:   tc15,
-      cnpTxnCount: cnp,
-      acquirerId:  merchant.acquirerId,
-    });
-
-    const ecpResult = cnp > 0 && tc15 > 0
-      ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp })
-      : null;
-
-    const efmResult = cnp > 0 && (tc40 > 0 || fraudAmt > 0)
-      ? calculateEFM({ fraudCount: tc40, cnpTxnCount: cnp, fraudAmountUSD: fraudAmt })
-      : null;
-
-    // Coerce null checklist values to false for scoring
-    const scoringChecklist = Object.fromEntries(
-      Object.entries(checklist).map(([k, v]) => [k, v === true])
-    );
-
-    const bankability = calculateBankabilityScore({
-      vampResult,
-      ecpResult,
-      efmResult,
-      checklist: scoringChecklist,
-    });
-
-    setResults({ vampResult, ecpResult, efmResult, bankability });
-  }, [txnData, merchant, checklist]);
+  // ── Go to dashboard from checklist (manual flow) ──────────────────────
 
   const handleGoToDashboard = useCallback(() => {
-    runAnalysis();
-    setView('dashboard');
-  }, [runAnalysis]);
+    const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
+    setResults(computed);
+    setView('gate');
+  }, [txnData, monthlyData, merchant, checklist]);
 
-  // Re-run analysis when navigating back to dashboard from report
+  // ── Lead gate submit ──────────────────────────────────────────────────
+
+  const handleLeadSubmit = useCallback(async (leadData) => {
+    setLead(leadData);
+    await sendLeadToWebhook({
+      ...leadData,
+      businessName:   merchant.businessName,
+      website:        merchant.website,
+      acquirerId:     merchant.acquirerId,
+    });
+    setView('report');
+  }, [merchant]);
+
+  // ── Navigation ────────────────────────────────────────────────────────
+
   const handleNavigate = useCallback((target) => {
-    if (target === 'dashboard' && results) {
-      runAnalysis();
+    if (target === 'gate' && results) {
+      // Re-run when navigating back from report
+      const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
+      setResults(computed);
     }
     setView(target);
-  }, [results, runAnalysis]);
+  }, [results, txnData, monthlyData, merchant, checklist]);
 
   const reset = () => {
     setMerchant(DEFAULT_MERCHANT);
     setTxnData(DEFAULT_TXN);
     setChecklist(DEFAULT_CHECKLIST);
     setParsedWarnings([]);
+    setMonthlyData([]);
     setResults(null);
+    setLead(null);
     setView('landing');
   };
 
@@ -263,6 +275,7 @@ export default function App() {
       )}
 
       <main className="flex-1">
+
         {/* ── Landing ── */}
         {view === 'landing' && (
           <LandingHero onStart={() => setView('upload')} />
@@ -275,7 +288,7 @@ export default function App() {
               <div>
                 <h2 className="text-2xl font-black text-white">Data Entry</h2>
                 <p className="text-sm text-slate-400 mt-1">
-                  Upload a processing statement or enter figures manually
+                  Upload processing statement(s) or enter figures manually
                 </p>
               </div>
               <button onClick={reset} className="text-xs text-slate-500 hover:text-slate-300 transition-colors">
@@ -286,7 +299,8 @@ export default function App() {
             <div className="card p-6">
               <UploadSection
                 onParsed={handleParsed}
-                onRunDashboard={handleRunDashboard}
+                onManualEntry={() => {}}
+                onSubmit={handleUploadSubmit}
               />
             </div>
 
@@ -316,24 +330,56 @@ export default function App() {
           </div>
         )}
 
-        {/* ── Dashboard ── */}
-        {view === 'dashboard' && results && (
-          <div className="max-w-7xl mx-auto px-4 py-10 animate-slide-up">
-            <Dashboard
-              merchant={merchant}
-              txnData={txnData}
-              vampResult={results.vampResult}
-              ecpResult={results.ecpResult}
-              efmResult={results.efmResult}
-              bankability={results.bankability}
-              onNext={() => setView('report')}
-            />
-          </div>
+        {/* ── Lead Gate ── */}
+        {view === 'gate' && results && (
+          <LeadGate
+            vampResult={results.vampResult}
+            bankability={results.bankability}
+            onSubmit={handleLeadSubmit}
+          />
         )}
 
         {/* ── Report ── */}
         {view === 'report' && results && (
-          <div className="max-w-5xl mx-auto px-4 py-10 animate-slide-up">
+          <div className="max-w-5xl mx-auto px-4 py-10 animate-slide-up space-y-8">
+
+            {/* Mentor's Analysis + Gauge + Charts */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* Left: Gauge */}
+              <div className="card p-5 flex flex-col justify-center">
+                <VAMPGauge
+                  vampRatio={results.vampResult?.vampRatio ?? 0}
+                  label={results.vampResult?.visaStatus ?? '—'}
+                />
+                {results.trendSummary?.rolling3Month?.ratio != null && (
+                  <p className="text-center text-xs text-slate-500 mt-3">
+                    3-mo avg:{' '}
+                    <span className="text-slate-300 font-mono font-semibold">
+                      {(results.trendSummary.rolling3Month.ratio * 100).toFixed(2)}%
+                    </span>
+                  </p>
+                )}
+              </div>
+
+              {/* Right: Mentor's Analysis (spans 2 cols) */}
+              <div className="lg:col-span-2">
+                <MentorAnalysis
+                  vampResult={results.vampResult}
+                  trendSummary={results.trendSummary}
+                  ecpResult={results.ecpResult}
+                  efmResult={results.efmResult}
+                />
+              </div>
+            </div>
+
+            {/* Trend chart — only if multiple months */}
+            {results.trendSummary?.hasMultipleMonths && (
+              <div className="card p-5">
+                <VolumeDisputesChart months={results.trendSummary.months} />
+              </div>
+            )}
+
+            {/* Risk Report (printable) */}
             <RiskReport
               merchant={merchant}
               txnData={txnData}
@@ -341,13 +387,13 @@ export default function App() {
               ecpResult={results.ecpResult}
               efmResult={results.efmResult}
               bankability={results.bankability}
-              onBack={() => setView('dashboard')}
+              onBack={() => setView('gate')}
             />
           </div>
         )}
 
-        {/* Fallback if dashboard/report state lost */}
-        {(view === 'dashboard' || view === 'report') && !results && (
+        {/* Fallback if gate/report state lost */}
+        {(view === 'gate' || view === 'report') && !results && (
           <div className="flex flex-col items-center justify-center py-32 gap-4">
             <p className="text-slate-400">No analysis data found.</p>
             <button onClick={() => setView('upload')} className="btn-primary">
@@ -355,6 +401,7 @@ export default function App() {
             </button>
           </div>
         )}
+
       </main>
 
       {view !== 'landing' && <Footer />}

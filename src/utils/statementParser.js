@@ -1,249 +1,34 @@
 /**
- * Statement Parser — CSV + PDF Client-Side Extraction Engine
+ * Statement Parser — CSV Extraction Engine (v2)
  *
- * CSV:  PapaParse with intelligent column-name detection.
- * PDF:  Mozilla PDF.js (pdfjs-dist) — full text extraction in the browser,
- *       no backend required, no data ever leaves the device.
+ * Improvements over v1:
+ *  • Null vs. Zero distinction: keyword found but value = 0 → records 0 (not "Not Found").
+ *    A missing column → records null and emits a warning.
+ *  • Month detection: `detectMonthFromFilename(filename)` scans the filename
+ *    for a recognisable month/year pattern.
+ *  • Multi-file: `parseStatements(files[])` returns an array of monthly data objects
+ *    sorted chronologically, each with a computed VAMP ratio.
  *
- * Keyword strategy: after extracting raw text from either format, the engine
- * runs two complementary passes:
- *
- *   1. Inline regex  — label and value appear on the same line, e.g.
- *                      "Sales Count: 10,000" or "Gross Volume  $500,000.00"
- *   2. Adjacent-line — label is on one line, value on the next, e.g.
- *                      "Chargeback Count\n45"
- *
- * The four primary keywords (per product spec) are:
- *   • "Sales Count"       → totalSalesCount  (+ cnpTxnCount fallback)
- *   • "Chargeback Count"  → tc15Count
- *   • "Fraud Count"       → tc40Count
- *   • "Gross Volume"      → totalSalesVolume
- *
- * Plus a wide net of common equivalents seen on Stripe, Chase, WorldPay,
- * First Data, Elavon, and Adyen statement exports.
- *
- * Privacy: pdfjs-dist runs entirely in the browser via a Web Worker.
- * No bytes of the uploaded file are sent over the network.
+ * Privacy-first: all parsing is done client-side. No data is uploaded
+ * to any server. Files are read via the browser's FileReader API and
+ * discarded from memory after extraction.
  */
 
 import Papa from 'papaparse';
+import { calculateMonthlyVAMP, formatMonthLabel } from './trendCalculator.js';
 
-// ── PDF.js: lazy-loaded on first PDF parse ───────────────────────────────────
-// Dynamic import keeps pdfjs-dist (~2 MB) out of the initial JS bundle.
-// It is only fetched when the user actually drops a PDF.
-let _pdfjsLib = null;
-
-async function getPdfjsLib() {
-  if (_pdfjsLib) return _pdfjsLib;
-  _pdfjsLib = await import('pdfjs-dist');
-  // Tell PDF.js where its worker lives.  The ?url suffix is a Vite feature
-  // that copies the file to dist/ and returns its public URL — no CDN needed.
-  const { default: workerUrl } = await import(
-    'pdfjs-dist/build/pdf.worker.min.mjs?url'
-  );
-  _pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-  return _pdfjsLib;
-}
-
-// ── Keyword patterns ─────────────────────────────────────────────────────────
-// Each field has an ordered list of regex patterns.  The first match wins.
-// Patterns are tried against the full extracted text (inline match).
-// Numbers may contain commas, dollar signs, and optional decimals.
-
-const NUM = '([\\$]?[0-9][0-9,]*(?:\\.[0-9]+)?)'; // capture group for a number
-
-const KEYWORD_PATTERNS = {
-  // ── "Sales Count" (exact) + common equivalents ────────────────────────────
-  totalSalesCount: [
-    new RegExp(`sales\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+sales[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`transaction\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`(?:total\\s+)?(?:txn|trx)\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`no\\.?\\s+of\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`purchase\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+items?[\\s:*]+${NUM}`, 'i'),
-  ],
-
-  // ── "Gross Volume" (exact) + common equivalents ───────────────────────────
-  totalSalesVolume: [
-    new RegExp(`gross\\s+volume[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`gross\\s+sales[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`total\\s+volume[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`sales\\s+volume[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`total\\s+sales\\s+(?:amount|volume)[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`gross\\s+amount[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`net\\s+sales[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`gross\\s+receipts[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`processing\\s+volume[\\s:*$]+${NUM}`, 'i'),
-  ],
-
-  // ── "Chargeback Count" (exact) + common equivalents ──────────────────────
-  tc15Count: [
-    new RegExp(`chargeback\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+chargebacks?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`dispute\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+disputes?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`no\\.?\\s+of\\s+chargebacks?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`cb\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`tc[-\\s]?15[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`retrieval\\s+requests?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`dispute\\s+(?:items?|transactions?)[\\s:*]+${NUM}`, 'i'),
-  ],
-
-  // ── "Fraud Count" (exact) + common equivalents ───────────────────────────
-  tc40Count: [
-    new RegExp(`fraud\\s+count[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`total\\s+fraud[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`fraud\\s+reports?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`tc[-\\s]?40[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`fraudulent\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`confirmed\\s+fraud[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`fraud\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`fraud\\s+items?[\\s:*]+${NUM}`, 'i'),
-  ],
-
-  // ── Fraud dollar amount ───────────────────────────────────────────────────
-  fraudAmountUSD: [
-    new RegExp(`fraud\\s+(?:amount|volume|dollars?)[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`total\\s+fraud\\s+amount[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`fraudulent\\s+(?:amount|volume)[\\s:*$]+${NUM}`, 'i'),
-    new RegExp(`tc[-\\s]?40\\s+(?:amount|volume)[\\s:*$]+${NUM}`, 'i'),
-  ],
-
-  // ── CNP-specific count ────────────────────────────────────────────────────
-  cnpTxnCount: [
-    new RegExp(`cnp\\s+(?:transactions?|count)[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`card[\\s-]not[\\s-]present[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`e[\\s-]?commerce\\s+(?:transactions?|count)[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`online\\s+(?:transactions?|count)[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`internet\\s+transactions?[\\s:*]+${NUM}`, 'i'),
-    new RegExp(`ecom(?:merce)?\\s+(?:transactions?|count)[\\s:*]+${NUM}`, 'i'),
-  ],
-};
-
-// ── Label patterns for adjacent-line matching ─────────────────────────────────
-// When the label and value are on separate lines we match the label line alone.
-const ADJACENT_LABELS = [
-  { field: 'totalSalesCount',  patterns: [/^sales\s+count$/i, /^total\s+(?:transactions?|sales)$/i, /^transaction\s+count$/i, /^(?:total\s+)?(?:txn|trx)\s+count$/i] },
-  { field: 'totalSalesVolume', patterns: [/^gross\s+volume$/i, /^gross\s+sales$/i, /^(?:total\s+)?sales\s+volume$/i, /^processing\s+volume$/i, /^gross\s+amount$/i] },
-  { field: 'tc15Count',        patterns: [/^chargeback\s+count$/i, /^total\s+chargebacks?$/i, /^dispute\s+count$/i, /^total\s+disputes?$/i, /^cb\s+count$/i] },
-  { field: 'tc40Count',        patterns: [/^fraud\s+count$/i, /^total\s+fraud$/i, /^fraud\s+reports?$/i, /^fraudulent\s+transactions?$/i] },
-  { field: 'fraudAmountUSD',   patterns: [/^fraud\s+amount$/i, /^total\s+fraud\s+amount$/i, /^fraudulent\s+amount$/i] },
-  { field: 'cnpTxnCount',      patterns: [/^cnp\s+(?:transactions?|count)$/i, /^card[\s-]not[\s-]present$/i, /^e[\s-]?commerce\s+(?:count|transactions?)$/i] },
-];
-
-// ── Text normalisation ────────────────────────────────────────────────────────
-
-function normalizeText(raw) {
-  return raw
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/[ \t]+/g, ' ')   // collapse horizontal whitespace
-    .replace(/\n{3,}/g, '\n\n') // collapse excessive blank lines
-    .trim();
-}
-
-function parseNumStr(str) {
-  // Strip $, commas, spaces; return float or NaN
-  const n = parseFloat(str.replace(/[$, ]/g, ''));
-  return isNaN(n) ? null : n;
-}
-
-// ── Pass 1: inline regex match ────────────────────────────────────────────────
-
-function inlineExtract(text) {
-  const extracted = {};
-  for (const [field, patterns] of Object.entries(KEYWORD_PATTERNS)) {
-    for (const pattern of patterns) {
-      const m = text.match(pattern);
-      if (m) {
-        const n = parseNumStr(m[1]);
-        if (n !== null && n >= 0) {
-          extracted[field] = n;
-          break;
-        }
-      }
-    }
-  }
-  return extracted;
-}
-
-// ── Pass 2: adjacent-line match ───────────────────────────────────────────────
-
-function adjacentLineExtract(text) {
-  const extracted = {};
-  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-
-  for (let i = 0; i < lines.length; i++) {
-    for (const { field, patterns } of ADJACENT_LABELS) {
-      if (extracted[field] !== undefined) continue;
-      for (const labelPat of patterns) {
-        if (labelPat.test(lines[i])) {
-          // Scan the next 3 lines for the first number
-          for (let j = i + 1; j <= Math.min(i + 3, lines.length - 1); j++) {
-            // Line might be purely numeric or start with a number/currency
-            const numMatch = lines[j].match(/^[\$]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/);
-            if (numMatch) {
-              const n = parseNumStr(numMatch[1]);
-              if (n !== null && n >= 0) {
-                extracted[field] = n;
-                break;
-              }
-            }
-          }
-          break; // matched this label — move to next field
-        }
-      }
-    }
-  }
-  return extracted;
-}
-
-// ── Merge & post-process extracted values ─────────────────────────────────────
-
-function mergeAndFinalize(inline, adjacent) {
-  // Adjacent-line wins only for fields not already found inline
-  const merged = { ...inline };
-  for (const [field, val] of Object.entries(adjacent)) {
-    if (merged[field] === undefined) merged[field] = val;
-  }
-
-  const warnings = [];
-
-  // CNP fallback: if CNP not found, use totalSalesCount as a proxy
-  if (!merged.cnpTxnCount && merged.totalSalesCount) {
-    merged.cnpTxnCount = merged.totalSalesCount;
-    warnings.push(
-      'CNP transaction count not detected — using total Sales Count as a proxy. ' +
-      'If this statement mixes card-present and card-not-present transactions, ' +
-      'your VAMP ratio may be understated.'
-    );
-  }
-
-  // Report missing primary fields
-  const required = { totalSalesCount: 'Sales Count', tc15Count: 'Chargeback Count', tc40Count: 'Fraud Count', totalSalesVolume: 'Gross Volume' };
-  for (const [field, label] of Object.entries(required)) {
-    if (merged[field] === undefined) {
-      warnings.push(`"${label}" not found — enter manually below.`);
-    }
-  }
-
-  return { merged, warnings };
-}
-
-// ── CSV column-name aliases (header-based detection) ─────────────────────────
+// ── Column-name aliases ────────────────────────────────────────────────────
 
 const COLUMN_ALIASES = {
   totalSalesCount: [
-    'sales count', 'total_transactions', 'transaction_count', 'txn_count', 'sales_count',
+    'total_transactions', 'transaction_count', 'txn_count', 'sales_count',
     'total_sales', 'total txns', 'transactions', 'total_txn_count',
-    'total transaction count', 'count', 'purchase count',
+    'total transaction count', 'count',
   ],
   totalSalesVolume: [
-    'gross volume', 'total_volume', 'sales_volume', 'gross_volume', 'total_amount',
+    'total_volume', 'sales_volume', 'gross_volume', 'total_amount',
     'gross_sales', 'volume', 'total_sales_volume', 'gross_amount',
-    'total volume', 'sales amount', 'net_sales', 'processing volume',
+    'total volume', 'sales amount', 'net_sales',
   ],
   cnpTxnCount: [
     'cnp_transactions', 'card_not_present', 'ecommerce_transactions',
@@ -251,13 +36,13 @@ const COLUMN_ALIASES = {
     'card not present count', 'internet_transactions', 'cnp',
   ],
   tc15Count: [
-    'chargeback count', 'chargebacks', 'disputes', 'tc15', 'chargeback_count',
-    'dispute_count', 'cb_count', 'total_chargebacks', 'total chargebacks',
-    'number_of_chargebacks', 'retrieval_requests', 'tc15_count',
+    'chargebacks', 'disputes', 'tc15', 'chargeback_count', 'dispute_count',
+    'cb_count', 'total_chargebacks', 'total chargebacks', 'number_of_chargebacks',
+    'retrieval_requests', 'tc15_count',
   ],
   tc40Count: [
-    'fraud count', 'fraud', 'tc40', 'fraud_count', 'fraud_transactions',
-    'tc40_count', 'fraud_reports', 'total_fraud', 'fraud items',
+    'fraud', 'tc40', 'fraud_count', 'fraud_transactions', 'tc40_count',
+    'fraud_reports', 'total_fraud', 'fraud count', 'fraud items',
     'fraudulent_transactions', 'confirmed_fraud',
   ],
   fraudAmountUSD: [
@@ -266,112 +51,196 @@ const COLUMN_ALIASES = {
   ],
 };
 
+// ── Month detection ────────────────────────────────────────────────────────
+
+const MONTH_MAP = {
+  jan: 0, january: 0,
+  feb: 1, february: 1,
+  mar: 2, march: 2,
+  apr: 3, april: 3,
+  may: 4,
+  jun: 5, june: 5,
+  jul: 6, july: 6,
+  aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  oct: 9, october: 9,
+  nov: 10, november: 10,
+  dec: 11, december: 11,
+};
+
+/**
+ * Attempt to extract {year, monthIndex, month} from a filename.
+ * Recognises patterns like:
+ *   statement_jan_2026.csv   → Jan 2026
+ *   2026-03_report.csv       → Mar 2026
+ *   april2025.pdf            → Apr 2025
+ *   2025_Q1_Feb.csv          → Feb 2025
+ *
+ * Returns null when no month/year can be reliably inferred.
+ *
+ * @param {string} filename
+ * @returns {{ year: number, monthIndex: number, month: string }|null}
+ */
+export function detectMonthFromFilename(filename) {
+  const base = filename.toLowerCase().replace(/\.[^.]+$/, ''); // strip extension
+
+  // Pattern 1: YYYY-MM or YYYY_MM
+  const numericMatch = base.match(/(\d{4})[-_](\d{1,2})/);
+  if (numericMatch) {
+    const year = parseInt(numericMatch[1], 10);
+    const mo   = parseInt(numericMatch[2], 10) - 1;
+    if (year >= 2020 && year <= 2030 && mo >= 0 && mo <= 11) {
+      return { year, monthIndex: mo, month: formatMonthLabel({ year, monthIndex: mo }) };
+    }
+  }
+
+  // Pattern 2: MM-YYYY or MM_YYYY
+  const numericMatch2 = base.match(/(\d{1,2})[-_](\d{4})/);
+  if (numericMatch2) {
+    const mo   = parseInt(numericMatch2[1], 10) - 1;
+    const year = parseInt(numericMatch2[2], 10);
+    if (year >= 2020 && year <= 2030 && mo >= 0 && mo <= 11) {
+      return { year, monthIndex: mo, month: formatMonthLabel({ year, monthIndex: mo }) };
+    }
+  }
+
+  // Pattern 3: month name (text) + 4-digit year anywhere in filename
+  const words = base.split(/[^a-z0-9]+/);
+  let foundMonth = null;
+  let foundYear  = null;
+
+  for (const word of words) {
+    if (MONTH_MAP[word] !== undefined) foundMonth = MONTH_MAP[word];
+    const asNum = parseInt(word, 10);
+    if (asNum >= 2020 && asNum <= 2030) foundYear = asNum;
+  }
+
+  if (foundMonth !== null && foundYear !== null) {
+    return {
+      year:       foundYear,
+      monthIndex: foundMonth,
+      month:      formatMonthLabel({ year: foundYear, monthIndex: foundMonth }),
+    };
+  }
+
+  // Pattern 4: month name alone — use current year
+  if (foundMonth !== null) {
+    const year = new Date().getFullYear();
+    return {
+      year,
+      monthIndex: foundMonth,
+      month:      formatMonthLabel({ year, monthIndex: foundMonth }),
+    };
+  }
+
+  return null;
+}
+
+// ── CSV helpers ────────────────────────────────────────────────────────────
+
 function detectColumn(headers, aliases) {
-  const normalized = headers.map((h) => h?.toLowerCase().trim().replace(/\s+/g, '_'));
+  const normalizedHeaders = headers.map((h) => h?.toLowerCase().trim().replace(/\s+/g, '_'));
   for (const alias of aliases) {
-    const a = alias.toLowerCase().replace(/\s+/g, '_');
-    const idx = normalized.indexOf(a);
+    const normalized = alias.toLowerCase().replace(/\s+/g, '_');
+    const idx = normalizedHeaders.indexOf(normalized);
     if (idx !== -1) return headers[idx];
   }
   return null;
 }
 
-function safeNum(value) {
-  if (value === null || value === undefined || value === '') return 0;
-  const n = parseFloat(String(value).replace(/[$,% ]/g, '').trim());
-  return isNaN(n) ? 0 : n;
+/**
+ * Parse a numeric cell value.
+ * Returns the parsed number (which may be 0) or null when the cell is absent/blank.
+ *
+ * Key difference from v1: blank / missing → null (not 0).
+ * This lets the caller distinguish "keyword found but zero" from "keyword not found".
+ *
+ * @param {*} value
+ * @returns {number|null}
+ */
+function parseNumeric(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const cleaned = String(value).replace(/[$,% ]/g, '').trim();
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? null : num;
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── CSV parser ─────────────────────────────────────────────────────────────
 
 /**
- * Parse a CSV processing statement.
+ * Parse a CSV File and return extracted transaction data.
  *
- * Strategy A: header column detection (structured CSV).
- * Strategy B: run keyword extraction on the raw CSV text as a fallback
- *             (for summary CSVs where values appear in description columns).
+ * Fields are null when the column was not found, and 0 when the column
+ * exists but all rows sum to zero.
+ *
+ * @param {File} file
+ * @returns {Promise<{ data: object, warnings: string[], columnMap: object, detectedFields: object }>}
  */
 export function parseCSVStatement(file) {
   return new Promise((resolve, reject) => {
-    // Strategy B needs the raw text — read in parallel
-    const reader = new FileReader();
-    let rawText = '';
-    reader.onload = (e) => { rawText = e.target.result ?? ''; };
-    reader.readAsText(file);
-
     Papa.parse(file, {
-      header: true,
+      header:         true,
       skipEmptyLines: true,
-      dynamicTyping: false,
+      dynamicTyping:  false,
       complete: (results) => {
-        if (!results.data?.length) {
+        if (!results.data || results.data.length === 0) {
           return reject(new Error('CSV file appears to be empty or has no data rows.'));
         }
 
         const headers = results.meta.fields ?? [];
         const warnings = [];
 
-        // ── Strategy A: column header matching ──
+        // Detect which columns exist
         const columnMap = {};
         for (const [field, aliases] of Object.entries(COLUMN_ALIASES)) {
           columnMap[field] = detectColumn(headers, aliases);
         }
 
+        // Sum rows; track which fields were actually found in the sheet
         const extracted = {
-          totalSalesCount: 0, totalSalesVolume: 0, cnpTxnCount: 0,
-          tc15Count: 0, tc40Count: 0, fraudAmountUSD: 0,
+          totalSalesCount:  null,
+          totalSalesVolume: null,
+          cnpTxnCount:      null,
+          tc15Count:        null,
+          tc40Count:        null,
+          fraudAmountUSD:   null,
         };
-        for (const row of results.data) {
-          for (const [field, col] of Object.entries(columnMap)) {
-            if (col && row[col] !== undefined) {
-              extracted[field] += safeNum(row[col]);
-            }
+
+        // detectedFields[field] = true  → column exists in CSV
+        //                        = false → column not found
+        const detectedFields = {};
+
+        for (const [field, colName] of Object.entries(columnMap)) {
+          detectedFields[field] = Boolean(colName);
+          if (!colName) {
+            warnings.push(`Column for "${field}" not detected — recorded as Not Found.`);
+            continue;
           }
+          // Column exists — sum all rows (result may be 0)
+          let sum = 0;
+          for (const row of results.data) {
+            const val = parseNumeric(row[colName]);
+            if (val !== null) sum += val;
+          }
+          extracted[field] = sum; // 0 is valid
         }
 
-        // ── Strategy B: keyword extraction on raw text (fallback) ──
-        // Used when column headers don't match but the CSV contains
-        // a summary section with labelled rows (common in bank exports).
-        const missingFields = Object.entries(extracted)
-          .filter(([k, v]) => v === 0 && k !== 'fraudAmountUSD')
-          .map(([k]) => k);
-
-        if (missingFields.length > 0 && rawText) {
-          const normalized = normalizeText(rawText);
-          const inlineKw = inlineExtract(normalized);
-          const adjacentKw = adjacentLineExtract(normalized);
-          for (const field of missingFields) {
-            const kwVal = inlineKw[field] ?? adjacentKw[field];
-            if (kwVal !== undefined) extracted[field] = kwVal;
-          }
-        }
-
-        // CNP fallback
-        if (!extracted.cnpTxnCount && extracted.totalSalesCount) {
+        // Fallback: if CNP not found, use totalSalesCount as proxy
+        if (extracted.cnpTxnCount === null && extracted.totalSalesCount !== null && extracted.totalSalesCount > 0) {
           extracted.cnpTxnCount = extracted.totalSalesCount;
           warnings.push(
-            'CNP count not found — using total Sales Count as proxy. ' +
-            'Adjust if statement mixes card-present transactions.'
+            'CNP count column not found. Using total transaction count as proxy. ' +
+            'Results may overstate VAMP ratio if card-present transactions are included.'
           );
-        }
-
-        const primaryLabels = {
-          totalSalesCount: 'Sales Count',
-          tc15Count: 'Chargeback Count',
-          tc40Count: 'Fraud Count',
-          totalSalesVolume: 'Gross Volume',
-        };
-        for (const [field, label] of Object.entries(primaryLabels)) {
-          if (!extracted[field]) warnings.push(`"${label}" not detected — enter manually.`);
         }
 
         resolve({
           data: extracted,
           warnings,
           columnMap,
+          detectedFields,
           rowCount: results.data.length,
           headers,
-          source: 'csv',
         });
       },
       error: (err) => reject(new Error(`CSV parse error: ${err.message}`)),
@@ -380,112 +249,124 @@ export function parseCSVStatement(file) {
 }
 
 /**
- * Parse a PDF processing statement using Mozilla PDF.js (browser-native,
- * no server, no external API).
+ * Attempt to extract data from a PDF file.
+ * Phase 1: Returns a structured notice explaining OCR is pending.
  *
- * Text is extracted page-by-page with Y-position sorting to reconstruct
- * reading order, then passed through both keyword extraction passes.
+ * @param {File} file
+ * @returns {Promise<{ data: null, notice: string, requiresManualEntry: true }>}
  */
 export async function parsePDFStatement(file) {
   if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
     throw new Error('File does not appear to be a PDF.');
   }
-
-  const pdfjsLib = await getPdfjsLib();
-  const arrayBuffer = await file.arrayBuffer();
-
-  let pdf;
-  try {
-    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
-    pdf = await loadingTask.promise;
-  } catch (err) {
-    throw new Error(
-      `PDF.js could not read this file: ${err.message}. ` +
-      'If the PDF is password-protected, please remove the password first.'
-    );
-  }
-
-  // Extract text from every page, restoring reading order via Y-sort
-  const pageTexts = [];
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-
-    // Sort: high Y first (top of page in PDF coordinate space), then low X
-    const items = [...content.items].sort((a, b) => {
-      const yDiff = b.transform[5] - a.transform[5];
-      if (Math.abs(yDiff) > 3) return yDiff;       // Different lines
-      return a.transform[4] - b.transform[4];        // Same line: L→R
-    });
-
-    let pageText = '';
-    let lastY = null;
-    for (const item of items) {
-      const y = Math.round(item.transform[5]);
-      if (lastY !== null && Math.abs(y - lastY) > 3) {
-        pageText += '\n';
-      } else if (lastY !== null && pageText && !pageText.endsWith(' ')) {
-        pageText += ' ';
-      }
-      pageText += item.str;
-      if (item.hasEOL) pageText += '\n';
-      lastY = y;
-    }
-    pageTexts.push(pageText);
-  }
-
-  const fullText = normalizeText(pageTexts.join('\n\n'));
-
-  // Run both extraction passes
-  const inline   = inlineExtract(fullText);
-  const adjacent = adjacentLineExtract(fullText);
-  const { merged, warnings } = mergeAndFinalize(inline, adjacent);
-
-  // Determine how much we got
-  const foundFields = Object.keys(merged).filter((k) => merged[k] !== undefined);
-  const hasMinimum  = Boolean(merged.cnpTxnCount);
-
   return {
-    data:              hasMinimum ? merged : null,
-    requiresManualEntry: !hasMinimum,
-    warnings,
-    filename:          file.name,
-    pageCount:         pdf.numPages,
-    fieldsFound:       foundFields,
-    notice:            hasMinimum
-      ? `Extracted ${foundFields.length} data field(s) from ${pdf.numPages}-page PDF. Review values below.`
-      : 'Could not auto-detect key figures from this PDF layout. Enter values manually — your file is not stored.',
-    source: 'pdf',
+    data:               null,
+    requiresManualEntry: true,
+    notice:
+      'PDF parsing via OCR is planned for Phase 2. For now, please review the uploaded ' +
+      'PDF and enter the key figures manually in the form below. Your PDF is not uploaded or stored.',
+    filename: file.name,
+    fileSize: file.size,
   };
 }
 
 /**
- * Dispatch to the correct parser based on file extension / MIME type.
+ * Dispatch to the correct parser based on file type.
+ *
+ * @param {File} file
+ * @returns {Promise<object>}
  */
 export async function parseStatement(file) {
   const ext = file.name.toLowerCase().split('.').pop();
-  if (ext === 'csv' || file.type === 'text/csv' || file.type === 'application/csv') {
-    return parseCSVStatement(file);
-  }
-  if (ext === 'pdf' || file.type === 'application/pdf') {
-    return parsePDFStatement(file);
-  }
-  throw new Error(`Unsupported file type ".${ext}". Upload a CSV or PDF statement.`);
+  if (ext === 'csv' || file.type === 'text/csv') return parseCSVStatement(file);
+  if (ext === 'pdf' || file.type === 'application/pdf') return parsePDFStatement(file);
+  throw new Error(`Unsupported file type ".${ext}". Please upload a CSV or PDF statement.`);
 }
 
 /**
- * Download a CSV template pre-labelled with the exact keyword headers
- * this engine recognises, so merchants can fill it in easily.
+ * Parse multiple statement files and return an array of monthly data objects
+ * sorted chronologically, each enriched with a computed VAMP ratio.
+ *
+ * Files that cannot be parsed (PDF, unsupported) are returned as {error} entries.
+ *
+ * @param {File[]} files
+ * @returns {Promise<object[]>}
+ */
+export async function parseStatements(files) {
+  const results = await Promise.allSettled(
+    files.map(async (file) => {
+      const res = await parseStatement(file);
+      const monthInfo = detectMonthFromFilename(file.name);
+
+      if (!res.data) {
+        // PDF or parse failure — return placeholder
+        return {
+          filename:  file.name,
+          month:     monthInfo?.month ?? file.name,
+          year:      monthInfo?.year  ?? null,
+          monthIndex: monthInfo?.monthIndex ?? null,
+          isPDF:     true,
+          data:      null,
+          warnings:  [],
+          error:     res.notice ?? 'Could not extract data from this file.',
+        };
+      }
+
+      const data = res.data;
+      const vampRatio = calculateMonthlyVAMP({
+        tc40Count:   data.tc40Count  ?? 0,
+        tc15Count:   data.tc15Count  ?? 0,
+        cnpTxnCount: data.cnpTxnCount ?? 0,
+      });
+
+      return {
+        filename:         file.name,
+        month:            monthInfo?.month ?? file.name,
+        year:             monthInfo?.year  ?? null,
+        monthIndex:       monthInfo?.monthIndex ?? null,
+        totalSalesCount:  data.totalSalesCount  ?? 0,
+        totalSalesVolume: data.totalSalesVolume ?? 0,
+        cnpTxnCount:      data.cnpTxnCount      ?? 0,
+        tc15Count:        data.tc15Count         ?? 0,
+        tc40Count:        data.tc40Count         ?? 0,
+        fraudAmountUSD:   data.fraudAmountUSD    ?? 0,
+        vampRatio,
+        warnings:         res.warnings ?? [],
+        detectedFields:   res.detectedFields ?? {},
+      };
+    })
+  );
+
+  const parsed = results.map((r) => (r.status === 'fulfilled' ? r.value : { error: r.reason?.message ?? 'Parse failed' }));
+
+  // Sort by year then monthIndex (files without month info go to end)
+  parsed.sort((a, b) => {
+    if (a.year == null && b.year == null) return 0;
+    if (a.year == null) return 1;
+    if (b.year == null) return -1;
+    if (a.year !== b.year) return a.year - b.year;
+    return (a.monthIndex ?? 0) - (b.monthIndex ?? 0);
+  });
+
+  return parsed;
+}
+
+/**
+ * Generate a sample CSV template the user can download.
  */
 export function generateCSVTemplate() {
-  const rows = [
-    ['sales count', 'gross volume', 'cnp_transactions', 'chargeback count', 'fraud count', 'fraud amount'],
-    ['10000',       '500000',       '8500',             '45',               '22',          '11000'],
+  const headers = [
+    'total_transactions', 'total_volume', 'cnp_transactions',
+    'chargebacks', 'fraud', 'fraud_amount',
   ];
-  const csv  = rows.map((r) => r.join(',')).join('\n');
+  const sampleRow = ['10000', '500000', '8500', '45', '22', '11000'];
+  const csv = [headers.join(','), sampleRow.join(',')].join('\n');
+
   const blob = new Blob([csv], { type: 'text/csv' });
   const url  = URL.createObjectURL(blob);
-  const a    = Object.assign(document.createElement('a'), { href: url, download: 'vamp_statement_template.csv' });
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'vamp_statement_template.csv';
   a.click();
   URL.revokeObjectURL(url);
 }
