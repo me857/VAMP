@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { ChevronDown, ArrowRight } from 'lucide-react';
 import Header from './components/Header.jsx';
 import Footer from './components/Footer.jsx';
 import UploadSection from './components/UploadSection.jsx';
@@ -139,7 +140,7 @@ function runCalculators({ txnData, monthlyData, merchant, checklist }) {
     acquirerId:  merchant.acquirerId,
   });
 
-  const ecpResult = cnp > 0 && tc15 > 0
+  const ecpResult = cnp > 0
     ? calculateECP({ chargebackCount: tc15, totalTxnCount: tot || cnp })
     : null;
 
@@ -147,20 +148,69 @@ function runCalculators({ txnData, monthlyData, merchant, checklist }) {
     ? calculateEFM({ fraudCount: tc40, cnpTxnCount: cnp, fraudAmountUSD: fraudAmt })
     : null;
 
-  const scoringChecklist = Object.fromEntries(
-    Object.entries(checklist).map(([k, v]) => [k, v === true])
-  );
-  const bankability = calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist: scoringChecklist });
+  // Pass raw checklist (null = not assessed, true/false = answered)
+  const bankability = calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist });
 
   const trendSummary = buildTrendSummary(monthlyData ?? []);
 
   return { vampResult, ecpResult, efmResult, bankability, trendSummary };
 }
 
+// ── Collapsible website audit section (upload page) ───────────────────────
+
+function WebsiteAuditSection({ merchant, checklist, onChange, onGenerate }) {
+  const [open, setOpen] = useState(false);
+  const answered = Object.values(checklist).filter((v) => v !== null && v !== undefined).length;
+
+  return (
+    <div className="card overflow-hidden">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between p-5 text-left hover:bg-slate-800/30 transition-colors"
+      >
+        <div>
+          <p className="text-sm font-semibold text-slate-200">
+            Website Compliance Audit
+            <span className="ml-2 text-xs font-normal text-blue-400">Optional · adds Bankability Score</span>
+          </p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {answered > 0
+              ? `${answered} of 9 items reviewed — included in this report`
+              : 'Skip for VAMP/ECP only, or expand to score your website compliance'}
+          </p>
+        </div>
+        <ChevronDown
+          size={16}
+          className={`text-slate-400 flex-shrink-0 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+
+      {open && (
+        <div className="border-t border-slate-800">
+          <div className="p-5">
+            <WebsiteAuditor
+              merchant={merchant}
+              checklist={checklist}
+              onChange={onChange}
+              inline
+            />
+          </div>
+          <div className="px-5 pb-5">
+            <button onClick={onGenerate} className="btn-primary w-full justify-center gap-2 py-3">
+              Generate Full Report with Website Analysis
+              <ArrowRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────
 
 export default function App() {
-  // views: landing | upload | checklist | dashboard | gate | report
+  // views: landing | upload | dashboard | gate | report
   const [view,          setView]          = useState('landing');
   const [merchant,      setMerchant]      = useState(DEFAULT_MERCHANT);
   const [txnData,       setTxnData]       = useState(DEFAULT_TXN);
@@ -240,6 +290,13 @@ export default function App() {
     setView('report');
   }, [merchant]);
 
+  // ── Refresh dashboard in-place (called from inline website audit) ─────
+
+  const handleRefreshDashboard = useCallback(() => {
+    const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
+    setResults(computed);
+  }, [txnData, monthlyData, merchant, checklist]);
+
   // ── Navigation ────────────────────────────────────────────────────────
 
   const handleNavigate = useCallback((target) => {
@@ -311,21 +368,16 @@ export default function App() {
                 onChange={updateMerchant}
                 onTxnChange={updateTxnData}
                 parsedWarnings={parsedWarnings}
-                onNext={() => setView('checklist')}
+                onNext={handleGoToDashboard}
               />
             </div>
-          </div>
-        )}
 
-        {/* ── Website Auditor ── */}
-        {view === 'checklist' && (
-          <div className="max-w-3xl mx-auto px-4 py-10 animate-slide-up">
-            <WebsiteAuditor
+            {/* Optional website audit — expand to include Bankability Score */}
+            <WebsiteAuditSection
               merchant={merchant}
               checklist={checklist}
               onChange={updateChecklist}
-              onBack={() => setView('upload')}
-              onNext={handleGoToDashboard}
+              onGenerate={handleGoToDashboard}
             />
           </div>
         )}
@@ -340,6 +392,9 @@ export default function App() {
               ecpResult={results.ecpResult}
               efmResult={results.efmResult}
               bankability={results.bankability}
+              checklist={checklist}
+              onChecklistChange={updateChecklist}
+              onRefreshAnalysis={handleRefreshDashboard}
               onNext={() => setView('gate')}
             />
           </div>

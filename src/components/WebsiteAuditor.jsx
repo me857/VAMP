@@ -174,7 +174,7 @@ function CheckItem({ id, meta, value, onChange }) {
   );
 }
 
-export default function WebsiteAuditor({ merchant, checklist, onChange, onBack, onNext }) {
+export default function WebsiteAuditor({ merchant, checklist, onChange, onBack, onNext, inline = false }) {
   const handleChange = (key, value) => {
     onChange({ [key]: value });
   };
@@ -202,19 +202,21 @@ export default function WebsiteAuditor({ merchant, checklist, onChange, onBack, 
 
   return (
     <div className="space-y-6 animate-fade-in">
-      {/* Header */}
-      <div>
-        <h2 className="text-2xl font-black text-white">Website Compliance Audit</h2>
-        <p className="text-sm text-slate-400 mt-1">
-          {merchant.website ? (
-            <a href={merchant.website} target="_blank" rel="noopener noreferrer"
-              className="text-blue-400 hover:text-blue-300 transition-colors inline-flex items-center gap-1">
-              {merchant.website} <ExternalLink size={11} />
-            </a>
-          ) : 'No website URL provided · '}
-          Review each item while examining the merchant's site
-        </p>
-      </div>
+      {/* Header — hidden when embedded inline */}
+      {!inline && (
+        <div>
+          <h2 className="text-2xl font-black text-white">Website Compliance Audit</h2>
+          <p className="text-sm text-slate-400 mt-1">
+            {merchant.website ? (
+              <a href={merchant.website} target="_blank" rel="noopener noreferrer"
+                className="text-blue-400 hover:text-blue-300 transition-colors inline-flex items-center gap-1">
+                {merchant.website} <ExternalLink size={11} />
+              </a>
+            ) : 'No website URL provided · '}
+            Review each item while examining the merchant's site
+          </p>
+        </div>
+      )}
 
       {/* Progress */}
       <div className="card p-4 flex items-center gap-5">
@@ -262,15 +264,17 @@ export default function WebsiteAuditor({ merchant, checklist, onChange, onBack, 
         </section>
       ))}
 
-      {/* Navigation */}
-      <div className="flex items-center justify-between pt-2">
-        <button onClick={onBack} className="btn-secondary">
-          <ChevronLeft size={16} /> Back to Data Entry
-        </button>
-        <button onClick={onNext} className="btn-primary">
-          View Risk Dashboard <ChevronRight size={16} />
-        </button>
-      </div>
+      {/* Navigation — hidden when embedded inline */}
+      {!inline && (
+        <div className="flex items-center justify-between pt-2">
+          <button onClick={onBack} className="btn-secondary">
+            <ChevronLeft size={16} /> Back to Data Entry
+          </button>
+          <button onClick={onNext} className="btn-primary">
+            View Risk Dashboard <ChevronRight size={16} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

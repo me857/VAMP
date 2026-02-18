@@ -87,24 +87,30 @@ export { CHECKLIST_WEIGHTS };
 
 /**
  * Score the website checklist.
+ * Returns score: null when no items have been answered (not assessed).
  * @param {object} checklist – key/value matching CHECKLIST_WEIGHTS keys
- * @returns {{ score: number, breakdown: object[], totalWeight: number }}
+ * @returns {{ score: number|null, breakdown: object[], totalWeight: number, answeredCount: number }}
  */
 export function scoreChecklist(checklist) {
   let earned = 0;
+  let answeredCount = 0;
   const totalWeight = Object.values(CHECKLIST_WEIGHTS).reduce((s, v) => s + v.weight, 0);
 
   const breakdown = Object.entries(CHECKLIST_WEIGHTS).map(([key, cfg]) => {
-    const passed = Boolean(checklist[key]);
+    const val = checklist[key];
+    const answered = val !== null && val !== undefined;
+    const passed = Boolean(val);
+    if (answered) answeredCount++;
     if (passed) earned += cfg.weight;
-    return { key, label: cfg.label, weight: cfg.weight, passed };
+    return { key, label: cfg.label, weight: cfg.weight, passed, answered };
   });
 
   return {
-    score: Math.round((earned / totalWeight) * 100),
+    score: answeredCount > 0 ? Math.round((earned / totalWeight) * 100) : null,
     earned,
     totalWeight,
     breakdown,
+    answeredCount,
   };
 }
 
@@ -124,13 +130,17 @@ export function calculateBankabilityScore({ vampResult, ecpResult, efmResult, ch
   const vScore = vampSubScore(vampResult);
   const cScore = ecpSubScore(ecpResult);
   const fScore = efmSubScore(efmResult);
-  const { score: wScore, breakdown: checklistBreakdown, earned: checklistEarned, totalWeight: checklistTotal } =
+  const { score: wScore, breakdown: checklistBreakdown, earned: checklistEarned, totalWeight: checklistTotal, answeredCount } =
     scoreChecklist(checklist ?? {});
 
-  // Weighted composite
-  // VAMP 50%, MC Network 20% (ECP+EFM averaged), Website 30%
+  const websiteAssessed = answeredCount > 0;
   const mcScore = Math.round((cScore + fScore) / 2);
-  const composite = Math.round(vScore * 0.50 + mcScore * 0.20 + wScore * 0.30);
+
+  // When website not assessed: reweight VAMP 71.4% / MC 28.6% (50:20 normalised to 100%)
+  // When assessed: VAMP 50%, MC 20%, Website 30%
+  const composite = websiteAssessed
+    ? Math.round(vScore * 0.50 + mcScore * 0.20 + (wScore ?? 0) * 0.30)
+    : Math.round(vScore * 0.714 + mcScore * 0.286);
 
   const grade = gradeFromScore(composite);
   const verdict = verdictFromScore(composite);
@@ -139,15 +149,17 @@ export function calculateBankabilityScore({ vampResult, ecpResult, efmResult, ch
     composite,
     grade,
     verdict,
+    websiteAssessed,
+    answeredCount,
     components: {
-      vamp: { score: vScore, weight: 0.50, label: 'Visa VAMP Health' },
-      mastercard: { score: mcScore, weight: 0.20, label: 'Mastercard Network Health' },
-      website: { score: wScore, weight: 0.30, label: 'Website Compliance' },
+      vamp:       { score: vScore,       weight: websiteAssessed ? 0.50  : 0.714, label: 'Visa VAMP Health' },
+      mastercard: { score: mcScore,      weight: websiteAssessed ? 0.20  : 0.286, label: 'Mastercard Network Health' },
+      website:    { score: wScore ?? 0,  weight: websiteAssessed ? 0.30  : 0,     label: 'Website Compliance' },
     },
     checklistBreakdown,
     checklistEarned,
     checklistTotal,
-    recommendations: buildRecommendations({ vampResult, ecpResult, efmResult, checklist, wScore }),
+    recommendations: buildRecommendations({ vampResult, ecpResult, efmResult, checklist, wScore: wScore ?? 0 }),
   };
 }
 
@@ -214,36 +226,37 @@ function buildRecommendations({ vampResult, ecpResult, efmResult, checklist, wSc
     });
   }
 
-  // Website checklist gaps
-  if (!checklist?.has3DS2) {
+  // Website checklist gaps — only when user explicitly answered 'No' (=== false)
+  // null/undefined means "not yet assessed" — no recommendation generated
+  if (checklist?.has3DS2 === false) {
     recs.push({
       priority: 'high',
       category: 'Website – Authentication',
       action: 'Deploy 3DS 2.x (3D Secure) on all eCommerce transactions. This is the single highest-impact fraud reduction measure and is required by Visa/Mastercard mandates.',
     });
   }
-  if (!checklist?.hasOneClickCancellation) {
+  if (checklist?.hasOneClickCancellation === false) {
     recs.push({
       priority: 'high',
       category: 'Website – Cancellation',
       action: 'Add a self-service cancellation mechanism (1-click or clearly accessible online). This is required by FTC regulations (ROSCA) and significantly reduces chargebacks.',
     });
   }
-  if (!checklist?.hasTermsAndConditions || !checklist?.termsEasyToFind) {
+  if (checklist?.hasTermsAndConditions === false || checklist?.termsEasyToFind === false) {
     recs.push({
       priority: 'high',
       category: 'Website – Legal Compliance',
       action: 'Terms & Conditions must be prominently linked before the point of purchase. Absent or hidden T&Cs are a leading cause of "not as described" chargebacks.',
     });
   }
-  if (!checklist?.hasRefundPolicy || !checklist?.refundPolicyVisible) {
+  if (checklist?.hasRefundPolicy === false || checklist?.refundPolicyVisible === false) {
     recs.push({
       priority: 'medium',
       category: 'Website – Refund Policy',
       action: 'Display refund policy clearly on the checkout page and product description page. Ambiguous refund terms drive "not satisfied" chargeback reason codes.',
     });
   }
-  if (!checklist?.mccMatchesDescriptor) {
+  if (checklist?.mccMatchesDescriptor === false) {
     recs.push({
       priority: 'high',
       category: 'Website – Descriptor',
