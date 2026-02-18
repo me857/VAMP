@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertTriangle, XCircle, CheckCircle, TrendingUp } from 'lucide-react';
+import { AlertTriangle, XCircle, CheckCircle, TrendingUp, HelpCircle } from 'lucide-react';
 import { RadialBarChart, RadialBar, ResponsiveContainer, PolarAngleAxis } from 'recharts';
 
 const GRADE_COLORS = {
@@ -56,6 +56,20 @@ function GaugeChart({ score, grade }) {
 }
 
 function ComponentBar({ label, score, weight }) {
+  const weightPct = Math.round(weight * 100);
+
+  if (weightPct === 0) {
+    return (
+      <div className="space-y-1">
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-slate-500">{label}</span>
+          <span className="text-slate-600 italic text-[10px]">Not assessed</span>
+        </div>
+        <div className="h-2 bg-slate-800/50 rounded-full" />
+      </div>
+    );
+  }
+
   const pct = Math.max(0, Math.min(100, score));
   const color = pct >= 80 ? '#22c55e' : pct >= 60 ? '#facc15' : pct >= 40 ? '#f97316' : '#ef4444';
 
@@ -65,7 +79,7 @@ function ComponentBar({ label, score, weight }) {
         <span className="text-slate-400">{label}</span>
         <span className="font-mono font-semibold text-white">
           {score}<span className="text-slate-500">/100</span>
-          <span className="text-slate-600 ml-1">(×{weight})</span>
+          <span className="text-slate-600 ml-1">({weightPct}%)</span>
         </span>
       </div>
       <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
@@ -81,7 +95,7 @@ function ComponentBar({ label, score, weight }) {
 export default function BankabilityScore({ bankability }) {
   if (!bankability) return null;
 
-  const { composite, grade, verdict, components, recommendations, checklistBreakdown } = bankability;
+  const { composite, grade, verdict, components, recommendations, checklistBreakdown, websiteAssessed } = bankability;
 
   return (
     <div className="space-y-5 animate-slide-up">
@@ -93,6 +107,11 @@ export default function BankabilityScore({ bankability }) {
             <p className="text-xs text-slate-500 uppercase tracking-widest mb-1">Bankability Score</p>
             <h2 className="text-2xl font-black text-white">{verdict.label}</h2>
             <p className="text-sm text-slate-400 mt-2 max-w-xs leading-relaxed">{verdict.description}</p>
+            {!websiteAssessed && (
+              <p className="text-[10px] text-slate-600 mt-2 italic">
+                Score based on transaction health only — website not assessed
+              </p>
+            )}
           </div>
         </div>
 
@@ -113,28 +132,46 @@ export default function BankabilityScore({ bankability }) {
 
       {/* Website checklist breakdown */}
       <div className="card p-5">
-        <h4 className="text-sm font-semibold text-slate-200 mb-4">Website Compliance Checklist</h4>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {checklistBreakdown?.map((item) => (
-            <div
-              key={item.key}
-              className={`flex items-center gap-2.5 p-2.5 rounded-lg ${
-                item.passed
-                  ? 'bg-green-950/30 border border-green-800/30'
-                  : 'bg-red-950/30 border border-red-800/30'
-              }`}
-            >
-              {item.passed
-                ? <CheckCircle size={14} className="text-green-400 flex-shrink-0" />
-                : <XCircle size={14} className="text-red-400 flex-shrink-0" />
-              }
-              <div className="flex-1 min-w-0">
-                <p className="text-xs text-slate-300 truncate">{item.label}</p>
-              </div>
-              <span className="text-[10px] text-slate-600 flex-shrink-0">×{item.weight}</span>
-            </div>
-          ))}
+        <div className="flex items-center justify-between mb-4">
+          <h4 className="text-sm font-semibold text-slate-200">Website Compliance Checklist</h4>
+          {!websiteAssessed && (
+            <span className="text-[10px] text-slate-500 italic">Not yet assessed</span>
+          )}
         </div>
+        {!websiteAssessed ? (
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Website compliance not included in this run. Use the "Add Website Compliance Analysis"
+            panel below to complete the audit and update your Bankability Score.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {checklistBreakdown?.map((item) => (
+              <div
+                key={item.key}
+                className={`flex items-center gap-2.5 p-2.5 rounded-lg ${
+                  !item.answered
+                    ? 'bg-slate-800/30 border border-slate-700/30'
+                    : item.passed
+                      ? 'bg-green-950/30 border border-green-800/30'
+                      : 'bg-red-950/30 border border-red-800/30'
+                }`}
+              >
+                {!item.answered
+                  ? <HelpCircle size={14} className="text-slate-500 flex-shrink-0" />
+                  : item.passed
+                    ? <CheckCircle size={14} className="text-green-400 flex-shrink-0" />
+                    : <XCircle size={14} className="text-red-400 flex-shrink-0" />
+                }
+                <div className="flex-1 min-w-0">
+                  <p className={`text-xs truncate ${item.answered ? 'text-slate-300' : 'text-slate-500'}`}>
+                    {item.label}
+                  </p>
+                </div>
+                <span className="text-[10px] text-slate-600 flex-shrink-0">×{item.weight}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Recommendations */}

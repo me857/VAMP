@@ -1,12 +1,13 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   TrendingDown, TrendingUp, AlertTriangle, DollarSign,
-  Activity, Shield, ChevronRight, BarChart3
+  Activity, Shield, ChevronRight, BarChart3, PlusCircle, RefreshCw,
 } from 'lucide-react';
 import { RadarChart, PolarGrid, PolarAngleAxis, Radar, ResponsiveContainer, Tooltip } from 'recharts';
 import TrafficLight from './TrafficLight.jsx';
 import ComparisonTable from './ComparisonTable.jsx';
 import BankabilityScore from './BankabilityScore.jsx';
+import WebsiteAuditor from './WebsiteAuditor.jsx';
 import { TIER_LABELS } from '../data/acquirers.js';
 
 function StatCard({ label, value, sub, icon: Icon, color = 'blue', highlight }) {
@@ -50,7 +51,7 @@ function RadarViz({ vampResult, ecpResult, efmResult, bankability }) {
     },
     {
       subject: 'Website',
-      score: bankability?.components?.website?.score ?? 0,
+      score: bankability?.websiteAssessed ? (bankability?.components?.website?.score ?? 0) : 50,
       fullMark: 100,
     },
     {
@@ -89,7 +90,63 @@ function RadarViz({ vampResult, ecpResult, efmResult, bankability }) {
   );
 }
 
-export default function Dashboard({ merchant, txnData, vampResult, ecpResult, efmResult, bankability, onNext }) {
+// ── Inline website audit panel (shown when website not yet assessed) ────────
+
+function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAnalysis }) {
+  const [open, setOpen] = useState(false);
+  const answered = Object.values(checklist).filter((v) => v !== null && v !== undefined).length;
+
+  return (
+    <div className="card overflow-hidden border border-blue-800/30 bg-blue-950/10">
+      <div className="p-5 flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <PlusCircle size={18} className="text-blue-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-semibold text-slate-200">Add Website Compliance Analysis</p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Website audit not included — Bankability Score is based on transaction health only.
+              Complete the audit below to get a full score including website compliance.
+            </p>
+            {answered > 0 && (
+              <p className="text-xs text-blue-400 mt-1">{answered} of 9 items reviewed</p>
+            )}
+          </div>
+        </div>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="btn-secondary text-xs py-1.5 px-3 flex-shrink-0"
+        >
+          {open ? 'Collapse' : 'Add Audit'}
+        </button>
+      </div>
+
+      {open && (
+        <div className="border-t border-slate-800 p-5 space-y-5">
+          <WebsiteAuditor
+            merchant={merchant}
+            checklist={checklist}
+            onChange={onChecklistChange}
+            inline
+          />
+          <button
+            onClick={onRefreshAnalysis}
+            className="btn-primary w-full justify-center gap-2"
+          >
+            <RefreshCw size={15} />
+            Refresh Analysis with Website Data
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main Dashboard ──────────────────────────────────────────────────────────
+
+export default function Dashboard({
+  merchant, txnData, vampResult, ecpResult, efmResult, bankability, onNext,
+  checklist, onChecklistChange, onRefreshAnalysis,
+}) {
   if (!vampResult) return null;
 
   const vampStatus  = vampResult.acquirerStatus?.key ?? 'healthy';
@@ -123,7 +180,7 @@ export default function Dashboard({ merchant, txnData, vampResult, ecpResult, ef
     {
       label: 'Chargeback Rate (ECP)',
       value: ecpResult ? `${ecpResult.percentage}%` : '—',
-      sub: ecpResult ? `${ecpResult.chargebackCount} chargebacks` : 'Not calculated',
+      sub: ecpResult ? `${ecpResult.chargebackCount} chargebacks · MC ECP` : 'Not calculated',
       icon: AlertTriangle,
       color: ecpStatus === 'healthy' ? 'green' : ecpStatus === 'warning' ? 'yellow' : 'red',
     },
@@ -137,7 +194,9 @@ export default function Dashboard({ merchant, txnData, vampResult, ecpResult, ef
     {
       label: 'Bankability Score',
       value: bankability ? `${bankability.composite}/100` : '—',
-      sub: bankability ? `Grade: ${bankability.grade} — ${bankability.verdict.label}` : '',
+      sub: bankability
+        ? `Grade: ${bankability.grade} — ${bankability.verdict.label}${bankability.websiteAssessed ? '' : ' (txn only)'}`
+        : '',
       icon: TrendingUp,
       color: (bankability?.composite ?? 0) >= 70 ? 'green' : (bankability?.composite ?? 0) >= 50 ? 'yellow' : 'red',
     },
@@ -252,6 +311,16 @@ export default function Dashboard({ merchant, txnData, vampResult, ecpResult, ef
           <BankabilityScore bankability={bankability} />
         </div>
       </div>
+
+      {/* Inline website audit prompt — shown when website not assessed */}
+      {!bankability?.websiteAssessed && checklist && onChecklistChange && onRefreshAnalysis && (
+        <WebsiteAuditPanel
+          merchant={merchant}
+          checklist={checklist}
+          onChecklistChange={onChecklistChange}
+          onRefreshAnalysis={onRefreshAnalysis}
+        />
+      )}
     </div>
   );
 }

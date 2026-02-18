@@ -3,7 +3,6 @@ import { ShieldCheck, ChevronRight } from 'lucide-react';
 
 const STEPS = [
   { id: 'upload',    label: 'Data Entry' },
-  { id: 'checklist', label: 'Site Audit' },
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'report',    label: 'Report' },
 ];
@@ -12,9 +11,7 @@ export default function Header({ currentView, onNavigate, hasResults }) {
   const currentIdx = STEPS.findIndex((s) => s.id === currentView);
 
   const canNavigateTo = (stepId) => {
-    const idx = STEPS.findIndex((s) => s.id === stepId);
     if (stepId === 'upload') return true;
-    if (stepId === 'checklist') return hasResults || currentIdx >= 1;
     if (stepId === 'dashboard') return hasResults;
     if (stepId === 'report') return hasResults;
     return false;

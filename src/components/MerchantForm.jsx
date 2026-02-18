@@ -256,7 +256,7 @@ export default function MerchantForm({ merchant, txnData, onChange, onTxnChange,
           disabled={!isValid}
           className="btn-primary"
         >
-          Run Site Audit Checklist
+          Generate Report
           <ChevronRight size={16} />
         </button>
       </div>
