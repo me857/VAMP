@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Lock, Mail, User, Globe, ArrowRight, Shield } from 'lucide-react';
+import { Lock, Mail, User, Globe, ArrowRight, Shield, ChevronDown } from 'lucide-react';
 import { VAMPGauge } from './TrendCharts.jsx';
 
 // ── Blurred metric preview ─────────────────────────────────────────────────
@@ -41,7 +41,7 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
     const e = {};
     if (!form.name.trim()) e.name = 'Name is required';
     if (!form.email.trim()) e.email = 'Email is required';
-    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) e.email = 'Invalid email address';
+    else if (!/^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(form.email.trim())) e.email = 'Enter a valid email address (e.g. name@company.com)';
     if (form.website && !/^https?:\/\//i.test(form.website) && !form.website.includes('.')) {
       e.website = 'Enter a valid URL or leave blank';
     }
@@ -113,8 +113,8 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
         </div>
         <h2 className="text-2xl font-black text-white">Your Results Are Ready</h2>
         <p className="text-sm text-slate-400 max-w-md mx-auto">
-          Enter your details below to unlock the full Risk Health Report, including your
-          VAMP gauge, trend charts, and Mentor&apos;s Analysis.
+          Your full Risk Health Report — including VAMP gauge, trend charts, and Bankability
+          Score — is waiting. Preview shown below.
         </p>
       </div>
 
@@ -143,8 +143,17 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
         </div>
       </div>
 
+      {/* Visual connector — makes it obvious the form unlocks the preview above */}
+      <div className="flex flex-col items-center gap-1 -my-2">
+        <ChevronDown size={18} className="text-blue-400 animate-bounce" />
+        <span className="text-xs font-semibold text-blue-400 uppercase tracking-widest">
+          Enter your details below to unlock
+        </span>
+        <ChevronDown size={18} className="text-blue-400 animate-bounce" />
+      </div>
+
       {/* Lead capture form */}
-      <div className="card p-6 space-y-5">
+      <div className="card p-6 space-y-5 ring-2 ring-blue-600/40">
         <div className="flex items-center gap-2 mb-1">
           <Shield size={16} className="text-blue-400" />
           <span className="text-sm font-semibold text-slate-200">Unlock Your Full Report</span>
