@@ -26,14 +26,15 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
   const [errors, setErrors] = useState({});
   const [submitting, setSubmitting] = useState(false);
 
-  const ratio    = vampResult?.vampRatio ?? 0;
-  const status   = vampResult?.visaStatus ?? 'HEALTHY';
-  const grade    = bankability?.grade ?? '—';
-  const score    = bankability?.score ?? 0;
+  const ratio       = vampResult?.vampRatio ?? 0;
+  const statusKey   = vampResult?.visaStatus?.key   ?? 'healthy';
+  const statusLabel = vampResult?.visaStatus?.label ?? 'Healthy';
+  const grade       = bankability?.grade     ?? '—';
+  const score       = bankability?.composite ?? 0;
 
   // Approximate colour for gauge status
-  const gaugeLabel = status === 'EXCESSIVE' ? 'Excessive Risk'
-    : status === 'WARNING' ? 'Approaching Warning'
+  const gaugeLabel = statusKey === 'excessive' ? 'Excessive Risk'
+    : statusKey === 'warning' ? 'Approaching Warning'
     : 'Within Limits';
 
   const validate = () => {
@@ -64,7 +65,7 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
         vampRatio: ratio,
         grade,
         score,
-        status,
+        status: statusKey,
       });
     } finally {
       setSubmitting(false);
@@ -129,7 +130,7 @@ export default function LeadGate({ vampResult, bankability, onSubmit }) {
             value={`${(ratio * 100).toFixed(2)}%`}
             colour={ratio >= 0.015 ? 'text-red-400' : ratio >= 0.01 ? 'text-yellow-400' : 'text-green-400'}
           />
-          <BlurredMetric label="Visa Status"   value={status} />
+          <BlurredMetric label="Visa Status"   value={statusLabel} />
           <BlurredMetric label="Grade"         value={grade}  />
           <BlurredMetric label="Bankability"   value={`${score}/100`} />
         </div>
