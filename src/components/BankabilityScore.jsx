@@ -130,7 +130,6 @@ export default function BankabilityScore({ bankability }) {
           <div className="flex flex-col justify-center">
             <p className="text-xs text-slate-500 uppercase tracking-widest mb-1">Bankability Score</p>
             <h2 className="text-2xl font-black text-white">{verdict.label}</h2>
-            <p className="text-sm text-slate-400 mt-2 max-w-xs leading-relaxed">{verdict.description}</p>
             {!websiteAssessed && (
               <p className="text-[10px] text-slate-600 mt-2 italic">
                 Score based on transaction health only — website not assessed
