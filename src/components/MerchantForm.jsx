@@ -6,6 +6,8 @@ import { MCC_CODES } from '../data/thresholds.js';
 const FIELD_TIPS = {
   cnpTxnCount:
     'Card-Not-Present (eCommerce/online) transaction count. VAMP applies to CNP only. If unknown, use total transaction count.',
+  mastercardTxnCount:
+    'Total Mastercard transaction count for this period. Used as the ECP denominator (chargebacks ÷ Mastercard txns). Found in the "Summary By Card Type" table on your statement — look for the Mastercard row\'s "Items" count.',
   tc15Count:
     'TC15 = Visa dispute / chargeback count. Use the "Dispute/Chargeback" line from your acquiring bank statement.',
   tc40Count:
@@ -174,6 +176,14 @@ export default function MerchantForm({ merchant, txnData, onChange, onTxnChange,
             onChange={(v) => onTxnChange({ cnpTxnCount: v })}
             placeholder="e.g. 8500"
             tip={FIELD_TIPS.cnpTxnCount}
+          />
+          <NumericInput
+            id="mastercardTxnCount"
+            label="Mastercard Transactions"
+            value={txnData.mastercardTxnCount || ''}
+            onChange={(v) => onTxnChange({ mastercardTxnCount: v })}
+            placeholder="e.g. 3200"
+            tip={FIELD_TIPS.mastercardTxnCount}
           />
           <NumericInput
             id="totalSalesCount"

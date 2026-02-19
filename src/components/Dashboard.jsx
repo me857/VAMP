@@ -92,9 +92,10 @@ function RadarViz({ vampResult, ecpResult, efmResult, bankability }) {
 
 // ── Inline website audit panel (shown when website not yet assessed) ────────
 
-function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAnalysis }) {
+function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAnalysis, currentScore, potentialScore }) {
   const [open, setOpen] = useState(false);
   const answered = Object.values(checklist).filter((v) => v !== null && v !== undefined).length;
+  const hasUplift = potentialScore != null && currentScore != null && potentialScore > currentScore;
 
   return (
     <div className="rounded-xl overflow-hidden border-2 border-amber-500/40 bg-amber-950/20 shadow-lg shadow-amber-900/10">
@@ -128,8 +129,14 @@ function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAn
         <div className="px-5 py-3 flex items-start gap-2 border-t border-amber-500/20">
           <span className="text-amber-500 text-sm mt-0.5">⚠</span>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Website compliance accounts for <span className="text-amber-300 font-semibold">30% of your Bankability Score</span>.
-            Complete the 9-item audit to get a full grade — it takes under 2 minutes.
+            Website compliance accounts for{' '}
+            <span className="text-amber-300 font-semibold">30% of your Bankability Score</span>.{' '}
+            {hasUplift ? (
+              <>Your current score is <span className="text-white font-semibold">{currentScore}/100</span> — a perfect audit could bring it to <span className="text-amber-300 font-semibold">{potentialScore}/100</span>.</>
+            ) : currentScore != null ? (
+              <>Your current score of <span className="text-white font-semibold">{currentScore}/100</span> already reflects your transaction data — completing the audit locks in your full grade.</>
+            ) : null}{' '}
+            It takes under 2 minutes.
           </p>
         </div>
       )}
@@ -166,6 +173,15 @@ export default function Dashboard({
   const vampStatus  = vampResult.acquirerStatus?.key ?? 'healthy';
   const ecpStatus   = ecpResult?.status?.key ?? 'healthy';
 
+  // Potential bankability score if website audit is completed perfectly
+  const websitePotential = !bankability?.websiteAssessed && bankability?.components
+    ? Math.round(
+        (bankability.components.vamp?.score       ?? 0) * 0.50 +
+        (bankability.components.mastercard?.score ?? 0) * 0.20 +
+        100 * 0.30
+      )
+    : null;
+
   // Overall worst-case status for the main traffic light
   const overallStatus =
     vampStatus === 'critical' || ecpStatus === 'critical' || efmResult?.enrolled
@@ -194,16 +210,28 @@ export default function Dashboard({
     {
       label: 'Chargeback Rate (ECP)',
       value: ecpResult ? `${ecpResult.percentage}%` : '—',
-      sub: ecpResult ? `${ecpResult.chargebackCount} chargebacks · MC ECP` : 'Not calculated',
+      sub: ecpResult
+        ? `${ecpResult.chargebackCount} chargebacks · MC ECP`
+        : vampResult.tc15Count === 0
+          ? 'Zero chargebacks confirmed · add txn count for ratio'
+          : 'Enter CNP/total txn count to calculate',
       icon: AlertTriangle,
-      color: ecpStatus === 'healthy' ? 'green' : ecpStatus === 'warning' ? 'yellow' : 'red',
+      color: ecpResult
+        ? (ecpStatus === 'healthy' ? 'green' : ecpStatus === 'warning' ? 'yellow' : 'red')
+        : vampResult.tc15Count === 0 ? 'green' : 'slate',
     },
     {
       label: 'Fraud Rate (EFM)',
       value: efmResult ? `${efmResult.percentage}%` : '—',
-      sub: efmResult?.enrolled ? 'EFM ENROLLED' : efmResult ? 'Not enrolled' : 'Not calculated',
+      sub: efmResult?.enrolled
+        ? 'EFM ENROLLED'
+        : efmResult
+          ? 'Not enrolled'
+          : vampResult.tc40Count === 0
+            ? 'Zero fraud items confirmed · not enrolled'
+            : 'Not calculated',
       icon: Shield,
-      color: efmResult?.enrolled ? 'red' : 'green',
+      color: efmResult?.enrolled ? 'red' : (efmResult || vampResult.tc40Count === 0) ? 'green' : 'slate',
     },
     {
       label: 'Bankability Score',
@@ -308,6 +336,20 @@ export default function Dashboard({
         </div>
       )}
 
+      {/* Info note: ECP/EFM missing transaction count */}
+      {!ecpResult && (vampResult.tc15Count === 0 || vampResult.tc40Count === 0) && !Number(txnData.cnpTxnCount) && !Number(txnData.totalSalesCount) && (
+        <div className="rounded-xl p-4 bg-blue-950/30 border border-blue-800/40 text-xs text-slate-400 leading-relaxed flex items-start gap-3">
+          <Activity size={14} className="text-blue-400 flex-shrink-0 mt-0.5" />
+          <span>
+            <span className="text-slate-200 font-semibold">Mastercard ECP/EFM ratios not shown</span>{' '}
+            — your statement shows zero chargebacks and zero fraud (healthy), but an exact ratio
+            requires a total transaction count which your PDF does not include. To see a precise ECP/EFM
+            percentage, go back to <span className="text-blue-400">Data Entry</span> and enter your
+            CNP or total transaction count manually.
+          </span>
+        </div>
+      )}
+
       {/* Comparison table */}
       <ComparisonTable vampResult={vampResult} ecpResult={ecpResult} efmResult={efmResult} />
 
@@ -318,6 +360,8 @@ export default function Dashboard({
           checklist={checklist}
           onChecklistChange={onChecklistChange}
           onRefreshAnalysis={onRefreshAnalysis}
+          currentScore={bankability?.composite}
+          potentialScore={websitePotential}
         />
       )}
 
