@@ -52,9 +52,11 @@ function vampSubScore(vampResult) {
 
 // ── ECP/EFM sub-score ─────────────────────────────────────────────────────────
 
-function ecpSubScore(ecpResult) {
-  if (!ecpResult) return 75; // neutral
-
+function ecpSubScore(ecpResult, tc15Count = null) {
+  if (!ecpResult) {
+    // Zero chargebacks → ECP ratio is 0/any = 0% regardless of denominator → perfect
+    return tc15Count === 0 ? 100 : 75;
+  }
   switch (ecpResult.status?.key) {
     case 'healthy':   return 100;
     case 'warning':   return 55;
@@ -64,8 +66,11 @@ function ecpSubScore(ecpResult) {
   }
 }
 
-function efmSubScore(efmResult) {
-  if (!efmResult) return 75;
+function efmSubScore(efmResult, tc40Count = null) {
+  if (!efmResult) {
+    // Zero fraud items → EFM not enrolled regardless of transaction count → perfect
+    return tc40Count === 0 ? 100 : 75;
+  }
   if (efmResult.enrolled) return 15;
   if (efmResult.ratioBreached || efmResult.amountBreached) return 50;
   return 100;
@@ -130,8 +135,8 @@ export function scoreChecklist(checklist) {
  */
 export function calculateBankabilityScore({ vampResult, ecpResult, efmResult, checklist }) {
   const vScore = vampSubScore(vampResult);
-  const cScore = ecpSubScore(ecpResult);
-  const fScore = efmSubScore(efmResult);
+  const cScore = ecpSubScore(ecpResult, vampResult?.tc15Count ?? null);
+  const fScore = efmSubScore(efmResult, vampResult?.tc40Count ?? null);
   const { score: wScore, breakdown: checklistBreakdown, earned: checklistEarned, totalWeight: checklistTotal, answeredCount } =
     scoreChecklist(checklist ?? {});
 
