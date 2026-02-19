@@ -167,11 +167,14 @@ const CARD_TYPE_PREFIXES = [
  *  • mastercardTxnCount   Mastercard row(s) in card-type table; fallback: MC TOTAL
  *                         row in the Interchange section; fallback: sum of MC
  *                         interchange category lines
- *  • visaTxnCount         Visa row(s) in card-type table (informational)
+ *  • visaTxnCount         Visa row(s) in card-type table; fallback: VS/VISA TOTAL
+ *                         row in Interchange section; fallback: sum of Visa category lines
  *  • Chargeback Cnt       0 when "No Chargebacks/Reversals" phrase detected OR when
  *                         page-1 summary shows Chargebacks/Reversals = $0.00
  *  • Fraud Count          Always 0 (not present in First Data statements)
  *  • statementPeriod      Extracted from date-range lines or "Month YYYY" in header
+ *  • CNP fallback         When Summary By Card Type is absent, total CNP is derived
+ *                         by summing all card-brand interchange totals found
  *
  * @param {string[]} lines
  * @returns {{ data: object, warnings: string[], detectedFields: object }}
@@ -191,23 +194,26 @@ function parseFirstDataFields(lines) {
   let mcCardFound   = false;
   let visaCardFound = false;
 
-  // Interchange-section fallback for MC count
+  // Interchange-section fallback for MC and Visa counts
   let mcInterchangeTotal = null;
   let mcInterchangeSum   = 0;   // sum of individual MC interchange category lines
+  let vsInterchangeTotal = null;
+  let vsInterchangeSum   = 0;   // sum of individual Visa interchange category lines
 
   // Statement period
   let statementPeriod = null;
 
   // Section / loop state
-  let inCardTypeSection   = false;
+  let inCardTypeSection    = false;
   let inInterchangeSection = false;
-  let cardSectionItemSum  = 0;
+  let cardSectionItemSum   = 0;
   let cardSectionRowsFound = 0;
-  let cbSectionFound      = false;
+  let cbSectionFound       = false;
 
-  // Interchange section: network/processing fee keywords to skip (not interchange categories)
-  const MC_NETWORK_FEE_KEYWORDS = ['ntwk', 'network access', 'pre-auth fee', 'acquirer processing',
-    'auth fee', 'assessment', 'brand fee', 'digital enablement', 'kilobyte', 'service fee'];
+  // Network/processing fee keywords to skip in interchange section (not per-transaction categories)
+  const NETWORK_FEE_KEYWORDS = ['ntwk', 'network access', 'pre-auth fee', 'acquirer processing',
+    'auth fee', 'assessment', 'brand fee', 'digital enablement', 'kilobyte', 'service fee',
+    'zero floor', 'misuse', 'licence fee'];
 
   for (let i = 0; i < lines.length; i++) {
     const line  = lines[i];
@@ -340,7 +346,7 @@ function parseFirstDataFields(lines) {
         (lower.startsWith('page ') && /page\s+\d+/i.test(lower));
       if (sectionEnds) { inInterchangeSection = false; continue; }
 
-      // Look for an explicit "MC TOTAL" or "MASTERCARD TOTAL" summary row first
+      // ── MC: explicit "MC TOTAL" / "MASTERCARD TOTAL" summary row ──────
       if (mcInterchangeTotal === null &&
           (/^mc\s+total\b/i.test(lower)         ||
            /^mastercard\s+total\b/i.test(lower) ||
@@ -349,16 +355,32 @@ function parseFirstDataFields(lines) {
         if (cnt !== null && cnt > 0) mcInterchangeTotal = cnt;
       }
 
-      // Sum individual MC interchange category lines as fallback.
-      // Skip network/processing fee lines (they aren't per-unique-transaction categories).
+      // ── Visa: explicit "VS TOTAL" / "VISA TOTAL" summary row ──────────
+      if (vsInterchangeTotal === null &&
+          (/^vs\s+total\b/i.test(lower)   ||
+           /^visa\s+total\b/i.test(lower) ||
+           /^total\s+(?:vs|visa)\b/i.test(lower))) {
+        const cnt = firstInt(line);
+        if (cnt !== null && cnt > 0) vsInterchangeTotal = cnt;
+      }
+
+      // ── Sum individual interchange category lines as fallback ──────────
+      // Skip network/processing fee lines — they're charged per-transaction but
+      // not exclusively (same transaction can incur multiple network fees).
+      const txnPattern = /(\d{1,6})\s+TRANS(?:ACTIONS?)?\s+AT\s+/i;
+
       const isMCLine = lower.startsWith('mc') || lower.startsWith('mastercard');
-      if (isMCLine) {
-        const isNetworkFee = MC_NETWORK_FEE_KEYWORDS.some((kw) => lower.includes(kw));
-        if (!isNetworkFee) {
-          // Match "N TRANSACTIONS AT" or "N TRANS AT"
-          const txnMatch = line.match(/(\d{1,6})\s+TRANS(?:ACTIONS?)?\s+AT\s+/i);
-          if (txnMatch) mcInterchangeSum += parseInt(txnMatch[1], 10);
-        }
+      if (isMCLine && !NETWORK_FEE_KEYWORDS.some((kw) => lower.includes(kw))) {
+        const m = line.match(txnPattern);
+        if (m) mcInterchangeSum += parseInt(m[1], 10);
+      }
+
+      // Visa interchange lines typically start with "VS" or "VISA" in fee sections
+      const isVSLine = lower.startsWith('vs ') || lower.startsWith('vs-') ||
+                       lower.startsWith('visa') && !lower.startsWith('visa debit'); // debit counted separately
+      if (isVSLine && !NETWORK_FEE_KEYWORDS.some((kw) => lower.includes(kw))) {
+        const m = line.match(txnPattern);
+        if (m) vsInterchangeSum += parseInt(m[1], 10);
       }
     }
   }
@@ -370,13 +392,11 @@ function parseFirstDataFields(lines) {
     salesCount = cardSectionItemSum;
   }
 
-  // Mastercard Transaction Count (priority order):
-  //   1. Direct from Summary By Card Type table (most reliable)
-  //   2. MC TOTAL row in interchange section
-  //   3. Sum of individual MC interchange categories (lowest confidence)
+  // ── Per-brand counts: priority 1 (card-type table) > 2 (brand total row) > 3 (category sum) ──
   let mastercardTxnCount = null;
-  let visaTxnCount = null;
+  let visaTxnCount       = null;
 
+  // Mastercard
   if (mcCardFound && mcCardSum > 0) {
     mastercardTxnCount = mcCardSum;
   } else if (mcInterchangeTotal !== null) {
@@ -387,8 +407,29 @@ function parseFirstDataFields(lines) {
     warnings.push('Mastercard transaction count estimated from interchange category lines — verify against statement.');
   }
 
+  // Visa
   if (visaCardFound && visaCardSum > 0) {
     visaTxnCount = visaCardSum;
+  } else if (vsInterchangeTotal !== null) {
+    visaTxnCount = vsInterchangeTotal;
+    warnings.push('Visa count taken from interchange section total row.');
+  } else if (vsInterchangeSum > 0) {
+    visaTxnCount = vsInterchangeSum;
+    warnings.push('Visa transaction count estimated from interchange category lines — verify against statement.');
+  }
+
+  // ── CNP / total-sales fallback: if Summary By Card Type was absent, derive from
+  //    card-brand interchange totals (MC + Visa + others). This gives a reasonable
+  //    VAMP denominator without manual entry.
+  if (salesCount === null) {
+    const brandTotal = (mastercardTxnCount ?? 0) + (visaTxnCount ?? 0);
+    if (brandTotal > 0) {
+      salesCount = brandTotal;
+      warnings.push(
+        'Total transaction count approximated from Mastercard + Visa interchange totals — ' +
+        'may exclude Discover/AMEX and other card types. Verify if you process multiple brands.'
+      );
+    }
   }
 
   // Chargeback Count: never leave null
