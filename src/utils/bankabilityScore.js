@@ -28,6 +28,8 @@ import { getAcquirerById } from '../data/acquirers.js';
  * drops sharply beyond excessive.
  */
 function vampSubScore(vampResult) {
+  // Zero chargebacks AND zero fraud → VAMP is definitively 0% → perfect score
+  if (vampResult?.tc40Count === 0 && vampResult?.tc15Count === 0) return 100;
   if (!vampResult || vampResult.cnpTxnCount <= 0) return 75; // neutral if no data
 
   const { ratio, effectiveWarning, effectiveExcessive } = vampResult;

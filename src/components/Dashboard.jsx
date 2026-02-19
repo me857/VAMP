@@ -97,31 +97,45 @@ function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAn
   const answered = Object.values(checklist).filter((v) => v !== null && v !== undefined).length;
 
   return (
-    <div className="card overflow-hidden border border-blue-800/30 bg-blue-950/10">
-      <div className="p-5 flex items-start justify-between gap-4">
-        <div className="flex items-start gap-3">
-          <PlusCircle size={18} className="text-blue-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <p className="text-sm font-semibold text-slate-200">Add Website Compliance Analysis</p>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Website audit not included — Bankability Score is based on transaction health only.
-              Complete the audit below to get a full score including website compliance.
+    <div className="rounded-xl overflow-hidden border-2 border-amber-500/40 bg-amber-950/20 shadow-lg shadow-amber-900/10">
+      {/* Banner header — always visible */}
+      <div className="bg-amber-500/10 px-5 py-4 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex-shrink-0 w-9 h-9 rounded-lg bg-amber-500/20 flex items-center justify-center">
+            <PlusCircle size={18} className="text-amber-400" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-amber-200 leading-tight">
+              Add Website Compliance Analysis
             </p>
-            {answered > 0 && (
-              <p className="text-xs text-blue-400 mt-1">{answered} of 9 items reviewed</p>
-            )}
+            <p className="text-xs text-amber-300/70 mt-0.5 leading-snug">
+              {answered > 0
+                ? `${answered}/9 items reviewed — click to finish the audit`
+                : 'Your Bankability Score is incomplete — website not yet assessed'}
+            </p>
           </div>
         </div>
         <button
           onClick={() => setOpen((o) => !o)}
-          className="btn-secondary text-xs py-1.5 px-3 flex-shrink-0"
+          className="flex-shrink-0 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-black text-xs font-bold transition-colors"
         >
-          {open ? 'Collapse' : 'Add Audit'}
+          {open ? 'Collapse ▲' : 'Start Audit ▶'}
         </button>
       </div>
 
+      {/* Expanded body */}
+      {!open && (
+        <div className="px-5 py-3 flex items-start gap-2 border-t border-amber-500/20">
+          <span className="text-amber-500 text-sm mt-0.5">⚠</span>
+          <p className="text-xs text-slate-400 leading-relaxed">
+            Website compliance accounts for <span className="text-amber-300 font-semibold">30% of your Bankability Score</span>.
+            Complete the 9-item audit to get a full grade — it takes under 2 minutes.
+          </p>
+        </div>
+      )}
+
       {open && (
-        <div className="border-t border-slate-800 p-5 space-y-5">
+        <div className="border-t border-amber-500/20 p-5 space-y-5">
           <WebsiteAuditor
             merchant={merchant}
             checklist={checklist}
@@ -297,6 +311,16 @@ export default function Dashboard({
       {/* Comparison table */}
       <ComparisonTable vampResult={vampResult} ecpResult={ecpResult} efmResult={efmResult} />
 
+      {/* Website audit CTA — shown prominently BEFORE the score when not yet assessed */}
+      {!bankability?.websiteAssessed && checklist && onChecklistChange && onRefreshAnalysis && (
+        <WebsiteAuditPanel
+          merchant={merchant}
+          checklist={checklist}
+          onChecklistChange={onChecklistChange}
+          onRefreshAnalysis={onRefreshAnalysis}
+        />
+      )}
+
       {/* Radar + Bankability */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
         <div className="lg:col-span-2">
@@ -311,16 +335,6 @@ export default function Dashboard({
           <BankabilityScore bankability={bankability} />
         </div>
       </div>
-
-      {/* Inline website audit prompt — shown when website not assessed */}
-      {!bankability?.websiteAssessed && checklist && onChecklistChange && onRefreshAnalysis && (
-        <WebsiteAuditPanel
-          merchant={merchant}
-          checklist={checklist}
-          onChecklistChange={onChecklistChange}
-          onRefreshAnalysis={onRefreshAnalysis}
-        />
-      )}
     </div>
   );
 }
