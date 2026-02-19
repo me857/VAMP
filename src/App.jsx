@@ -425,6 +425,7 @@ export default function App() {
               checklist={checklist}
               onChecklistChange={updateChecklist}
               onRefreshAnalysis={handleRefreshDashboard}
+              onMerchantChange={updateMerchant}
               onNext={() => setView('report')}
               onEdit={() => setView('upload')}
             />
