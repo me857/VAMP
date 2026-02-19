@@ -107,7 +107,7 @@ function LandingHero({ onStart }) {
       {/* How it works */}
       <div className="mt-16 grid grid-cols-1 sm:grid-cols-4 gap-4 max-w-3xl w-full text-left">
         {[
-          { step: '1', title: 'Upload Statements', desc: 'Drop up to 3 months of CSV statements for trend analysis.' },
+          { step: '1', title: 'Upload Statements', desc: 'Drop up to 3 months of PDF or CSV processing statements. Data is extracted automatically.' },
           { step: '2', title: 'Audit Website',     desc: "Complete the dynamic compliance checklist for the merchant's site." },
           { step: '3', title: 'Unlock Report',     desc: 'Enter your details to unlock the full Risk Health Report.' },
           { step: '4', title: 'View & Print',      desc: 'See gauges, trend charts, and export a professional PDF.' },
@@ -371,16 +371,24 @@ export default function App() {
                 </p>
               </div>
               <button onClick={reset} className="text-xs text-slate-500 hover:text-slate-300 transition-colors">
-                ← Landing
+                ← Start Over
               </button>
             </div>
 
             <div className="card p-6">
               <UploadSection
                 onParsed={handleParsed}
-                onManualEntry={() => {}}
                 onSubmit={handleUploadSubmit}
               />
+            </div>
+
+            {/* Divider: fast path above (CSV upload) / review path below (form) */}
+            <div className="flex items-center gap-3">
+              <div className="flex-1 h-px bg-slate-800" />
+              <span className="text-[11px] text-slate-600 uppercase tracking-widest">
+                or review / enter data manually
+              </span>
+              <div className="flex-1 h-px bg-slate-800" />
             </div>
 
             <div className="card p-6">
@@ -418,6 +426,7 @@ export default function App() {
               onChecklistChange={updateChecklist}
               onRefreshAnalysis={handleRefreshDashboard}
               onNext={() => setView('report')}
+              onEdit={() => setView('upload')}
             />
           </div>
         )}
@@ -441,7 +450,7 @@ export default function App() {
               <div className="card p-5 flex flex-col justify-center">
                 <VAMPGauge
                   vampRatio={results.vampResult?.vampRatio ?? 0}
-                  label={results.vampResult?.visaStatus ?? '—'}
+                  label={results.vampResult?.visaStatus?.label ?? '—'}
                 />
                 {results.trendSummary?.rolling3Month?.ratio != null && (
                   <p className="text-center text-xs text-slate-500 mt-3">

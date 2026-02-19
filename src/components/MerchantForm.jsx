@@ -260,7 +260,12 @@ export default function MerchantForm({ merchant, txnData, onChange, onTxnChange,
       </section>
 
       <div className="flex items-center justify-between pt-2">
-        <p className="text-xs text-slate-500">* Required for VAMP calculation</p>
+        <p className="text-xs text-slate-500">
+          {!isValid
+            ? <span className="text-amber-500">↑ CNP transaction count required to calculate VAMP</span>
+            : '* Required for VAMP calculation'
+          }
+        </p>
         <button
           type="submit"
           disabled={!isValid}

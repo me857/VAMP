@@ -85,7 +85,7 @@ function FileEntry({ entry, onRemove }) {
 
 // ── Main component ─────────────────────────────────────────────────────────
 
-export default function UploadSection({ onParsed, onManualEntry, onSubmit }) {
+export default function UploadSection({ onParsed, onSubmit }) {
   const fileRef     = useRef(null);
   const [dragging,  setDragging]  = useState(false);
   const [parsing,   setParsing]   = useState(false);
@@ -260,13 +260,6 @@ export default function UploadSection({ onParsed, onManualEntry, onSubmit }) {
         </button>
       )}
 
-      {/* Skip link */}
-      <button
-        onClick={onManualEntry}
-        className="text-xs text-slate-500 hover:text-slate-300 transition-colors underline underline-offset-2"
-      >
-        Skip upload and enter data manually →
-      </button>
     </div>
   );
 }
