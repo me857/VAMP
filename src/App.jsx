@@ -227,16 +227,20 @@ export default function App() {
   const updateTxnData   = useCallback((patch) => setTxnData((p) => ({ ...p, ...patch })), []);
   const updateChecklist = useCallback((patch) => setChecklist((p) => ({ ...p, ...patch })), []);
 
-  // Called when UploadSection parses files — pre-fills the form with latest month
+  // Called when UploadSection parses files — pre-fills the form with latest month.
+  // Uses detectedFields to avoid overwriting existing form values with 0 when the
+  // PDF could not extract a field (e.g. salesCount not found → cnpTxnCount = 0
+  // which is NOT the same as "genuinely zero transactions").
   const handleParsed = useCallback((latestMonthData, warnings) => {
+    const detected = latestMonthData.detectedFields ?? {};
     setTxnData((prev) => ({
       ...prev,
-      totalSalesCount:  latestMonthData.totalSalesCount  ?? prev.totalSalesCount,
-      totalSalesVolume: latestMonthData.totalSalesVolume ?? prev.totalSalesVolume,
-      cnpTxnCount:      latestMonthData.cnpTxnCount      ?? prev.cnpTxnCount,
-      tc15Count:        latestMonthData.tc15Count         ?? prev.tc15Count,
-      tc40Count:        latestMonthData.tc40Count         ?? prev.tc40Count,
-      fraudAmountUSD:   latestMonthData.fraudAmountUSD   ?? prev.fraudAmountUSD,
+      totalSalesCount:  detected.totalSalesCount  ? latestMonthData.totalSalesCount  : prev.totalSalesCount,
+      totalSalesVolume: detected.totalSalesVolume ? latestMonthData.totalSalesVolume : prev.totalSalesVolume,
+      cnpTxnCount:      detected.cnpTxnCount      ? latestMonthData.cnpTxnCount      : prev.cnpTxnCount,
+      tc15Count:        detected.tc15Count        ? latestMonthData.tc15Count        : prev.tc15Count,
+      tc40Count:        detected.tc40Count        ? latestMonthData.tc40Count        : prev.tc40Count,
+      fraudAmountUSD:   detected.fraudAmountUSD   ? latestMonthData.fraudAmountUSD   : prev.fraudAmountUSD,
     }));
     setParsedWarnings(warnings);
   }, []);
@@ -267,15 +271,15 @@ export default function App() {
 
     setTxnData(merged);
     setResults(computed);
-    setView('dashboard');
+    setView('gate');
   }, [merchant, checklist]);
 
-  // ── Go to dashboard from checklist (manual flow) ──────────────────────
+  // ── Generate report — runs calculators then shows email gate ─────────
 
   const handleGoToDashboard = useCallback(() => {
     const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
     setResults(computed);
-    setView('dashboard');
+    setView('gate');
   }, [txnData, monthlyData, merchant, checklist]);
 
   // ── Lead gate submit ──────────────────────────────────────────────────
@@ -288,7 +292,7 @@ export default function App() {
       website:        merchant.website,
       acquirerId:     merchant.acquirerId,
     });
-    setView('report');
+    setView('dashboard');
   }, [merchant]);
 
   // ── Refresh dashboard in-place (called from inline website audit) ─────
@@ -301,8 +305,8 @@ export default function App() {
   // ── Navigation ────────────────────────────────────────────────────────
 
   const handleNavigate = useCallback((target) => {
-    if ((target === 'dashboard' || target === 'gate') && results) {
-      // Re-run when navigating back from a later step
+    if (target === 'dashboard' && results) {
+      // Re-run when navigating back to dashboard
       const computed = runCalculators({ txnData, monthlyData, merchant, checklist });
       setResults(computed);
     }
@@ -396,7 +400,7 @@ export default function App() {
               checklist={checklist}
               onChecklistChange={updateChecklist}
               onRefreshAnalysis={handleRefreshDashboard}
-              onNext={() => setView('gate')}
+              onNext={() => setView('report')}
             />
           </div>
         )}
