@@ -28,7 +28,7 @@ import { getAcquirerById } from '../data/acquirers.js';
  * drops sharply beyond excessive.
  */
 function vampSubScore(vampResult) {
-  if (!vampResult || vampResult.cnpTxnCount <= 0) return 50; // neutral if no data
+  if (!vampResult || vampResult.cnpTxnCount <= 0) return 75; // neutral if no data
 
   const { ratio, effectiveWarning, effectiveExcessive } = vampResult;
 
