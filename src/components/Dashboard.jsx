@@ -165,7 +165,7 @@ function WebsiteAuditPanel({ merchant, checklist, onChecklistChange, onRefreshAn
 // ── Main Dashboard ──────────────────────────────────────────────────────────
 
 export default function Dashboard({
-  merchant, txnData, vampResult, ecpResult, efmResult, bankability, onNext,
+  merchant, txnData, vampResult, ecpResult, efmResult, bankability, onNext, onEdit,
   checklist, onChecklistChange, onRefreshAnalysis,
 }) {
   if (!vampResult) return null;
@@ -269,9 +269,19 @@ export default function Dashboard({
             {vampResult.acquirer?.name ?? 'Unknown'}
           </p>
         </div>
-        <button onClick={onNext} className="btn-primary self-start sm:self-auto">
-          Generate Report <ChevronRight size={16} />
-        </button>
+        <div className="flex items-center gap-3 self-start sm:self-auto">
+          {onEdit && (
+            <button
+              onClick={onEdit}
+              className="px-4 py-2 rounded-lg text-sm font-semibold text-slate-400 border border-slate-700 hover:border-slate-500 hover:text-slate-200 transition-colors"
+            >
+              ← Edit Data
+            </button>
+          )}
+          <button onClick={onNext} className="btn-primary">
+            Generate Report <ChevronRight size={16} />
+          </button>
+        </div>
       </div>
 
       {/* Traffic light + key stats */}

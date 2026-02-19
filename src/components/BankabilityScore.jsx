@@ -1,6 +1,5 @@
 import React from 'react';
 import { AlertTriangle, XCircle, CheckCircle, TrendingUp, HelpCircle } from 'lucide-react';
-import { RadialBarChart, RadialBar, ResponsiveContainer, PolarAngleAxis } from 'recharts';
 
 const GRADE_COLORS = {
   'A+': '#22c55e',
@@ -18,41 +17,63 @@ const PRIORITY_CONFIG = {
   low:      { icon: TrendingUp,     color: 'text-blue-400',   bg: 'bg-blue-950/40',   border: 'border-blue-800/50',   label: 'Low' },
 };
 
+// Pure-SVG gauge — no third-party chart library, no SVG overlay conflicts.
+// Arc spans 260° with the 100° gap centred at the bottom (6 o'clock).
+// Drawing convention: SVG circle starts at east (3 o'clock), going CW.
+// Rotating by 140° places the arc start at ~7:30 o'clock (140° CW from east).
 function GaugeChart({ score, grade }) {
   const color = GRADE_COLORS[grade] ?? '#94a3b8';
-  const data = [{ value: score, fill: color }];
+  const SIZE = 180;
+  const cx   = SIZE / 2;   // 90
+  const cy   = SIZE / 2;   // 90
+  const R    = 70;          // stroke-centre radius
+  const SW   = 14;          // stroke width
+  const GAP  = 100;         // gap degrees centred at bottom
+  const ARC  = 360 - GAP;  // 260° of visible arc
+
+  const circumference  = 2 * Math.PI * R;
+  const arcLen         = (ARC  / 360) * circumference;
+  const progressLen    = (Math.max(0, Math.min(100, score)) / 100) * arcLen;
+
+  // rotate(140) → arc starts at 140° CW from east = ~7:30 o'clock
+  // gap then sits from 40° to 140° CW from east = centred at 90° = 6 o'clock ✓
+  const rot = `rotate(140, ${cx}, ${cy})`;
 
   return (
-    <div className="relative mx-auto flex-shrink-0" style={{ width: 180, height: 180 }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <RadialBarChart
-          cx="50%"
-          cy="50%"
-          innerRadius="65%"
-          outerRadius="90%"
-          barSize={14}
-          data={data}
-          startAngle={220}
-          endAngle={-40}
-        >
-          <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
-          <RadialBar
-            background={{ fill: '#1e293b' }}
-            dataKey="value"
-            angleAxisId={0}
-            cornerRadius={4}
+    <div className="relative mx-auto flex-shrink-0" style={{ width: SIZE, height: SIZE }}>
+      <svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`} style={{ display: 'block' }}>
+        {/* Track */}
+        <circle
+          cx={cx} cy={cy} r={R}
+          fill="none"
+          stroke="#1e293b"
+          strokeWidth={SW}
+          strokeLinecap="round"
+          strokeDasharray={`${arcLen} ${circumference - arcLen}`}
+          transform={rot}
+        />
+        {/* Progress */}
+        {progressLen > 0 && (
+          <circle
+            cx={cx} cy={cy} r={R}
+            fill="none"
+            stroke={color}
+            strokeWidth={SW}
+            strokeLinecap="round"
+            strokeDasharray={`${progressLen} ${circumference - progressLen}`}
+            transform={rot}
           />
-        </RadialBarChart>
-      </ResponsiveContainer>
+        )}
+      </svg>
 
-      {/* Center text — sits above SVG via z-index, no pointer capture */}
+      {/* Center label — plain DOM div, zero SVG interaction, zero z-index battle */}
       <div
         className="absolute inset-0 flex flex-col items-center justify-center"
-        style={{ pointerEvents: 'none', zIndex: 1 }}
+        style={{ pointerEvents: 'none' }}
       >
-        <span className="text-4xl font-black" style={{ color }}>{grade}</span>
-        <span className="text-2xl font-bold text-white">{score}</span>
-        <span className="text-[10px] text-slate-500 uppercase tracking-widest">Score</span>
+        <span className="text-4xl font-black leading-none" style={{ color }}>{grade}</span>
+        <span className="text-2xl font-bold text-white leading-none mt-0.5">{score}</span>
+        <span className="text-[10px] text-slate-500 uppercase tracking-widest mt-0.5">Score</span>
       </div>
     </div>
   );
