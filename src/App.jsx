@@ -28,12 +28,13 @@ const DEFAULT_MERCHANT = {
 };
 
 const DEFAULT_TXN = {
-  totalSalesCount: '',
-  totalSalesVolume: '',
-  cnpTxnCount: '',
-  tc15Count: '',
-  tc40Count: '',
-  fraudAmountUSD: '',
+  totalSalesCount:    '',
+  totalSalesVolume:   '',
+  cnpTxnCount:        '',
+  mastercardTxnCount: '',  // Mastercard-specific count for ECP denominator
+  tc15Count:          '',
+  tc40Count:          '',
+  fraudAmountUSD:     '',
 };
 
 const DEFAULT_CHECKLIST = {
@@ -127,11 +128,12 @@ function LandingHero({ onStart }) {
 // ── Helper: run all calculators synchronously from raw data ───────────────
 
 function runCalculators({ txnData, monthlyData, merchant, checklist }) {
-  const tc40     = Number(txnData.tc40Count)        || 0;
-  const tc15     = Number(txnData.tc15Count)        || 0;
-  const cnp      = Number(txnData.cnpTxnCount)      || 0;
-  const tot      = Number(txnData.totalSalesCount)  || cnp;
-  const fraudAmt = Number(txnData.fraudAmountUSD)   || 0;
+  const tc40     = Number(txnData.tc40Count)          || 0;
+  const tc15     = Number(txnData.tc15Count)          || 0;
+  const cnp      = Number(txnData.cnpTxnCount)        || 0;
+  const tot      = Number(txnData.totalSalesCount)    || cnp;
+  const mc       = Number(txnData.mastercardTxnCount) || 0;  // Mastercard-specific count
+  const fraudAmt = Number(txnData.fraudAmountUSD)     || 0;
 
   const vampResult = analyzeVAMP({
     tc40Count:   tc40,
@@ -140,7 +142,8 @@ function runCalculators({ txnData, monthlyData, merchant, checklist }) {
     acquirerId:  merchant.acquirerId,
   });
 
-  const ecpTxnCount = cnp || tot;
+  // ECP denominator: prefer Mastercard-specific count, then CNP total, then gross total
+  const ecpTxnCount = mc || cnp || tot;
   const ecpResult = ecpTxnCount > 0
     ? calculateECP({ chargebackCount: tc15, totalTxnCount: ecpTxnCount })
     : null;
@@ -235,13 +238,20 @@ export default function App() {
     const detected = latestMonthData.detectedFields ?? {};
     setTxnData((prev) => ({
       ...prev,
-      totalSalesCount:  detected.totalSalesCount  ? latestMonthData.totalSalesCount  : prev.totalSalesCount,
-      totalSalesVolume: detected.totalSalesVolume ? latestMonthData.totalSalesVolume : prev.totalSalesVolume,
-      cnpTxnCount:      detected.cnpTxnCount      ? latestMonthData.cnpTxnCount      : prev.cnpTxnCount,
-      tc15Count:        detected.tc15Count        ? latestMonthData.tc15Count        : prev.tc15Count,
-      tc40Count:        detected.tc40Count        ? latestMonthData.tc40Count        : prev.tc40Count,
-      fraudAmountUSD:   detected.fraudAmountUSD   ? latestMonthData.fraudAmountUSD   : prev.fraudAmountUSD,
+      totalSalesCount:    detected.totalSalesCount    ? latestMonthData.totalSalesCount    : prev.totalSalesCount,
+      totalSalesVolume:   detected.totalSalesVolume   ? latestMonthData.totalSalesVolume   : prev.totalSalesVolume,
+      cnpTxnCount:        detected.cnpTxnCount        ? latestMonthData.cnpTxnCount        : prev.cnpTxnCount,
+      mastercardTxnCount: detected.mastercardTxnCount ? latestMonthData.mastercardTxnCount : prev.mastercardTxnCount,
+      tc15Count:          detected.tc15Count          ? latestMonthData.tc15Count          : prev.tc15Count,
+      tc40Count:          detected.tc40Count          ? latestMonthData.tc40Count          : prev.tc40Count,
+      fraudAmountUSD:     detected.fraudAmountUSD     ? latestMonthData.fraudAmountUSD     : prev.fraudAmountUSD,
     }));
+    // Pre-fill statement period when extracted from PDF and not yet manually set
+    if (detected.statementPeriod && latestMonthData.statementPeriod) {
+      setMerchant((prev) =>
+        prev.statementPeriod ? prev : { ...prev, statementPeriod: latestMonthData.statementPeriod }
+      );
+    }
     setParsedWarnings(warnings);
   }, []);
 
@@ -254,13 +264,20 @@ export default function App() {
     // Use the most recent month's data to pre-fill form and run analysis
     const latest = csvMonths[csvMonths.length - 1];
     const merged = {
-      totalSalesCount:  latest.totalSalesCount  ?? 0,
-      totalSalesVolume: latest.totalSalesVolume ?? 0,
-      cnpTxnCount:      latest.cnpTxnCount      ?? 0,
-      tc15Count:        latest.tc15Count         ?? 0,
-      tc40Count:        latest.tc40Count         ?? 0,
-      fraudAmountUSD:   latest.fraudAmountUSD   ?? 0,
+      totalSalesCount:    latest.totalSalesCount    ?? 0,
+      totalSalesVolume:   latest.totalSalesVolume   ?? 0,
+      cnpTxnCount:        latest.cnpTxnCount        ?? 0,
+      mastercardTxnCount: latest.mastercardTxnCount ?? '',  // keep null-extracted as empty
+      tc15Count:          latest.tc15Count          ?? 0,
+      tc40Count:          latest.tc40Count          ?? 0,
+      fraudAmountUSD:     latest.fraudAmountUSD     ?? 0,
     };
+    // Pre-fill statement period from PDF-extracted value if not already set
+    if (latest.statementPeriod) {
+      setMerchant((prev) =>
+        prev.statementPeriod ? prev : { ...prev, statementPeriod: latest.statementPeriod }
+      );
+    }
 
     const computed = runCalculators({
       txnData:     merged,

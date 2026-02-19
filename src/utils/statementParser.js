@@ -96,6 +96,32 @@ function firstInt(line) {
 }
 
 /**
+ * Attempt to extract a statement period (e.g. "January 2026") from a line.
+ * Tries:
+ *   1. Date range: "MM/DD/YYYY THROUGH MM/DD/YYYY" → formats end date
+ *   2. Month name + 4-digit year anywhere in the line
+ * Returns a formatted string like "January 2026" or null.
+ */
+function extractPeriodFromLine(line) {
+  // Pattern 1: MM/DD/YYYY THROUGH/TO MM/DD/YYYY → use end date
+  const range = line.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s+(?:THROUGH|TO)\s+(\d{1,2}\/\d{1,2}\/\d{4})/i);
+  if (range) {
+    const p = range[2].split('/');
+    const d = new Date(parseInt(p[2], 10), parseInt(p[0], 10) - 1, parseInt(p[1], 10));
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    }
+  }
+  // Pattern 2: "January 2026" (or any month name + 4-digit year ≥ 2020)
+  const monthYear = line.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i);
+  if (monthYear && parseInt(monthYear[2], 10) >= 2020) {
+    const mn = monthYear[1][0].toUpperCase() + monthYear[1].slice(1).toLowerCase();
+    return `${mn} ${monthYear[2]}`;
+  }
+  return null;
+}
+
+/**
  * Extract the first dollar/decimal amount from a line (e.g. "$269,742.10").
  * Returns null if none found.
  */
@@ -135,36 +161,65 @@ const CARD_TYPE_PREFIXES = [
 /**
  * Parse extracted PDF lines using First Data / ServeFirst statement rules.
  *
- * Field rules (per product spec):
- *  • Gross Volume   "Total Amount Submitted" — inline or adjacent line
- *  • Sales Count    Sum of "Items" column in Summary By Card Type (excl. Adjustments)
- *                   Uses the Total row when present (more reliable).
- *  • Chargeback Cnt = 0 when "No Chargebacks/Reversals" phrase detected OR when the
- *                   page-1 summary shows Chargebacks/Reversals = $0.00. Never null.
- *  • Fraud Count    Always 0 (not present in First Data statements).
+ * Field rules:
+ *  • Gross Volume         "Total Amount Submitted" — inline or adjacent line
+ *  • Sales Count          Total row of "Summary By Card Type" Items column
+ *  • mastercardTxnCount   Mastercard row(s) in card-type table; fallback: MC TOTAL
+ *                         row in the Interchange section; fallback: sum of MC
+ *                         interchange category lines
+ *  • visaTxnCount         Visa row(s) in card-type table (informational)
+ *  • Chargeback Cnt       0 when "No Chargebacks/Reversals" phrase detected OR when
+ *                         page-1 summary shows Chargebacks/Reversals = $0.00
+ *  • Fraud Count          Always 0 (not present in First Data statements)
+ *  • statementPeriod      Extracted from date-range lines or "Month YYYY" in header
  *
  * @param {string[]} lines
  * @returns {{ data: object, warnings: string[], detectedFields: object }}
  */
 function parseFirstDataFields(lines) {
-  const warnings  = [];
+  const warnings = [];
+
+  // Core fields
   let grossVolume     = null;
   let salesCount      = null;
-  let chargebackCount = null;   // will always be resolved to a number before return
-  const fraudCount    = 0;      // constant — not in First Data statements
+  let chargebackCount = null;  // always resolved to a number before return
+  const fraudCount    = 0;     // constant — not in First Data statements
 
-  let inCardTypeSection = false;
-  let cardSectionItemSum = 0;
+  // Per-brand card counts (extracted from Summary By Card Type)
+  let mcCardSum     = 0;   // Mastercard rows accumulated
+  let visaCardSum   = 0;   // Visa rows accumulated
+  let mcCardFound   = false;
+  let visaCardFound = false;
+
+  // Interchange-section fallback for MC count
+  let mcInterchangeTotal = null;
+  let mcInterchangeSum   = 0;   // sum of individual MC interchange category lines
+
+  // Statement period
+  let statementPeriod = null;
+
+  // Section / loop state
+  let inCardTypeSection   = false;
+  let inInterchangeSection = false;
+  let cardSectionItemSum  = 0;
   let cardSectionRowsFound = 0;
-  let cbSectionFound = false;
+  let cbSectionFound      = false;
+
+  // Interchange section: network/processing fee keywords to skip (not interchange categories)
+  const MC_NETWORK_FEE_KEYWORDS = ['ntwk', 'network access', 'pre-auth fee', 'acquirer processing',
+    'auth fee', 'assessment', 'brand fee', 'digital enablement', 'kilobyte', 'service fee'];
 
   for (let i = 0; i < lines.length; i++) {
     const line  = lines[i];
     const lower = line.toLowerCase().trim();
 
+    // ── 0. Statement period (scan entire document; stop after first match) ──
+    if (statementPeriod === null) {
+      statementPeriod = extractPeriodFromLine(line);
+    }
+
     // ── 1. Gross Volume ────────────────────────────────────────────────
     if (grossVolume === null && GROSS_LABELS.some((lbl) => lower.includes(lbl))) {
-      // Try inline (same line has a dollar amount)
       let val = firstDollar(line);
       if (val === null && i + 1 < lines.length) val = firstDollar(lines[i + 1]);
       if (val === null && i + 2 < lines.length) val = firstDollar(lines[i + 2]);
@@ -176,7 +231,7 @@ function parseFirstDataFields(lines) {
       chargebackCount = 0;
     }
 
-    // ── 3. Chargeback Count — page-1 summary "Chargebacks/Reversals $0.00" ──
+    // ── 3. Chargeback Count — page-1 "Chargebacks/Reversals $0.00" ────
     if (chargebackCount === null &&
         lower.includes('chargeback') && lower.includes('reversal')) {
       cbSectionFound = true;
@@ -184,102 +239,176 @@ function parseFirstDataFields(lines) {
       if (dollar === 0) {
         chargebackCount = 0;
       } else if (dollar === null) {
-        // Might be the section heading — look for a count integer
         const cnt = firstInt(line);
         if (cnt !== null) chargebackCount = cnt;
       }
-      // If dollar > 0: there are chargebacks but we need the count from the detail section
     }
 
-    // ── 4. Chargeback Count — from "Total Chargebacks N $X" row ───────
+    // ── 4. Chargeback Count — "Total Chargebacks N $X" row ────────────
     if (chargebackCount === null &&
         lower.startsWith('total chargeback') && !lower.includes('amount')) {
       const cnt = firstInt(line);
       if (cnt !== null) chargebackCount = cnt;
     }
 
-    // ── 5. Summary By Card Type section detection ──────────────────────
+    // ── Section boundary: Summary By Card Type start ───────────────────
     if (lower.includes('summary by card type') || lower.includes('card type summary')) {
-      inCardTypeSection = true;
-      // Reset partial sums for this section
-      cardSectionItemSum  = 0;
+      inCardTypeSection    = true;
+      inInterchangeSection = false;
+      cardSectionItemSum   = 0;
       cardSectionRowsFound = 0;
+      mcCardSum = 0; visaCardSum = 0;
+      mcCardFound = false; visaCardFound = false;
       salesCount = null;
-      continue;
+      continue;  // skip the heading line itself
     }
 
-    // Detect end of card-type section (next major heading or page boundary)
+    // ── Section boundary: Interchange / Fee Detail start ──────────────
+    if (!inCardTypeSection &&
+        (lower.includes('interchange') ||
+         lower === 'fee detail' || lower === 'fee summary' ||
+         lower.startsWith('fee detail') || lower.startsWith('fee summary'))) {
+      inInterchangeSection = true;
+    }
+
+    // ── Process: Summary By Card Type rows ────────────────────────────
     if (inCardTypeSection) {
-      const isNewSection =
-        lower.includes('summary by day') ||
+      // Detect section end
+      const sectionEnds =
+        lower.includes('summary by day')   ||
         lower.includes('summary by batch') ||
         lower.includes('adjustment detail') ||
-        lower.includes('fee detail') ||
+        lower.includes('fee detail')        ||
         lower.includes('chargeback detail') ||
         (lower.startsWith('page ') && /page\s+\d+/i.test(lower));
-      if (isNewSection) { inCardTypeSection = false; }
-    }
 
-    if (!inCardTypeSection) continue;
-
-    // Skip column header rows and rows that are clearly dollar totals
-    if (lower.includes('items') || lower.includes('net amount') ||
-        lower.includes('submitted') || lower.includes('reversals')) continue;
-
-    // Adjustments row — explicitly excluded per spec
-    if (lower.startsWith('adjustment') || lower.includes('adjustment')) continue;
-
-    // ── "Total" row → definitive Items sum ────────────────────────────
-    if (/^\s*total\b/i.test(lower) &&
-        !lower.includes('amount') && !lower.includes('gross') && !lower.includes('submitted')) {
-      const cnt = firstInt(line);
-      if (cnt !== null && cnt > 0) {
-        salesCount = cnt;   // authoritative — stop counting individual rows
+      if (sectionEnds) {
         inCardTypeSection = false;
-        continue;
+        // The ending keyword might also open another section
+        if (lower.includes('fee detail') || lower.includes('interchange')) {
+          inInterchangeSection = true;
+        }
+        // Do NOT continue — fall through so interchange section also processes this line
+      } else {
+        // Skip column header rows
+        if (lower.includes('items') || lower.includes('net amount') ||
+            lower.includes('submitted') || lower.includes('reversals')) continue;
+
+        // Adjustments row — excluded (adjustments aren't sales)
+        if (lower.startsWith('adjustment') || lower.includes('adjustment')) continue;
+
+        // "Total" row → definitive Items sum
+        if (/^\s*total\b/i.test(lower) &&
+            !lower.includes('amount') && !lower.includes('gross') && !lower.includes('submitted')) {
+          const cnt = firstInt(line);
+          if (cnt !== null && cnt > 0) {
+            salesCount = cnt;
+            inCardTypeSection = false;
+          }
+          continue;
+        }
+
+        // Individual card-type row — check brand and accumulate
+        const startsWithCardType = CARD_TYPE_PREFIXES.some((ct) => lower.startsWith(ct));
+        if (startsWithCardType) {
+          const cnt = firstInt(line);
+          if (cnt !== null && cnt > 0) {
+            cardSectionItemSum += cnt;
+            cardSectionRowsFound++;
+
+            // Mastercard rows: "mastercard", "master card", "mc " (but not "misc")
+            const isMC = lower.startsWith('mastercard') || lower.startsWith('master card') ||
+              (lower.startsWith('mc') && !lower.startsWith('misc'));
+            if (isMC) { mcCardSum += cnt; mcCardFound = true; }
+
+            // Visa rows: "visa" (includes visa debit, visa credit, etc.)
+            const isVisa = lower.startsWith('visa');
+            if (isVisa) { visaCardSum += cnt; visaCardFound = true; }
+          }
+        }
+        continue;  // processed this line in card-type section
       }
     }
 
-    // ── Individual card-type row ───────────────────────────────────────
-    const startsWithCardType = CARD_TYPE_PREFIXES.some((ct) => lower.startsWith(ct));
-    if (startsWithCardType) {
-      const cnt = firstInt(line);
-      if (cnt !== null && cnt > 0) {
-        cardSectionItemSum  += cnt;
-        cardSectionRowsFound++;
+    // ── Process: Interchange section rows ─────────────────────────────
+    if (inInterchangeSection) {
+      // Detect section end
+      const sectionEnds =
+        lower.includes('chargeback detail') ||
+        lower.includes('discount summary')  ||
+        lower.includes('summary by day')    ||
+        (lower.startsWith('page ') && /page\s+\d+/i.test(lower));
+      if (sectionEnds) { inInterchangeSection = false; continue; }
+
+      // Look for an explicit "MC TOTAL" or "MASTERCARD TOTAL" summary row first
+      if (mcInterchangeTotal === null &&
+          (/^mc\s+total\b/i.test(lower)         ||
+           /^mastercard\s+total\b/i.test(lower) ||
+           /^total\s+(?:mc|mastercard)\b/i.test(lower))) {
+        const cnt = firstInt(line);
+        if (cnt !== null && cnt > 0) mcInterchangeTotal = cnt;
+      }
+
+      // Sum individual MC interchange category lines as fallback.
+      // Skip network/processing fee lines (they aren't per-unique-transaction categories).
+      const isMCLine = lower.startsWith('mc') || lower.startsWith('mastercard');
+      if (isMCLine) {
+        const isNetworkFee = MC_NETWORK_FEE_KEYWORDS.some((kw) => lower.includes(kw));
+        if (!isNetworkFee) {
+          // Match "N TRANSACTIONS AT" or "N TRANS AT"
+          const txnMatch = line.match(/(\d{1,6})\s+TRANS(?:ACTIONS?)?\s+AT\s+/i);
+          if (txnMatch) mcInterchangeSum += parseInt(txnMatch[1], 10);
+        }
       }
     }
   }
 
   // ── Post-loop resolution ───────────────────────────────────────────────
 
-  // Sales Count: use Total row result; fall back to summed card rows
+  // Sales Count: authoritative Total row → summed card rows → null
   if (salesCount === null && cardSectionRowsFound > 0) {
     salesCount = cardSectionItemSum;
   }
 
-  // Chargeback Count: never leave null — default to 0 with a warning if uncertain
-  if (chargebackCount === null) {
-    chargebackCount = 0;
-    if (cbSectionFound) {
-      warnings.push(
-        'Chargeback section found but count could not be extracted. Defaulted to 0 — please verify.'
-      );
-    } else {
-      warnings.push('Chargeback section not found in PDF. Defaulted to 0.');
-    }
+  // Mastercard Transaction Count (priority order):
+  //   1. Direct from Summary By Card Type table (most reliable)
+  //   2. MC TOTAL row in interchange section
+  //   3. Sum of individual MC interchange categories (lowest confidence)
+  let mastercardTxnCount = null;
+  let visaTxnCount = null;
+
+  if (mcCardFound && mcCardSum > 0) {
+    mastercardTxnCount = mcCardSum;
+  } else if (mcInterchangeTotal !== null) {
+    mastercardTxnCount = mcInterchangeTotal;
+    warnings.push('Mastercard count taken from interchange section total row.');
+  } else if (mcInterchangeSum > 0) {
+    mastercardTxnCount = mcInterchangeSum;
+    warnings.push('Mastercard transaction count estimated from interchange category lines — verify against statement.');
   }
 
-  // Missing field warnings (gross & count only — chargebacks always resolved)
-  if (grossVolume === null) {
+  if (visaCardFound && visaCardSum > 0) {
+    visaTxnCount = visaCardSum;
+  }
+
+  // Chargeback Count: never leave null
+  if (chargebackCount === null) {
+    chargebackCount = 0;
     warnings.push(
-      '"Total Amount Submitted" not found in PDF. Please enter Gross Volume manually.'
+      cbSectionFound
+        ? 'Chargeback section found but count could not be extracted. Defaulted to 0 — please verify.'
+        : 'Chargeback section not found in PDF. Defaulted to 0.'
     );
   }
+
+  if (grossVolume === null) {
+    warnings.push('"Total Amount Submitted" not found in PDF. Please enter Gross Volume manually.');
+  }
   if (salesCount === null) {
-    warnings.push(
-      '"Summary By Card Type" Items column not found. Please enter Sales Count manually.'
-    );
+    warnings.push('"Summary By Card Type" Items column not found. Please enter Sales Count manually.');
+  }
+  if (mastercardTxnCount === null) {
+    warnings.push('Mastercard transaction count not found in PDF. Enter it manually for a precise ECP calculation.');
   }
 
   const anyExtracted = grossVolume !== null || salesCount !== null;
@@ -287,23 +416,28 @@ function parseFirstDataFields(lines) {
   return {
     data: anyExtracted
       ? {
-          totalSalesCount:  salesCount,
-          totalSalesVolume: grossVolume,
-          // Treat all items as CNP (First Data is predominantly CNP/e-commerce)
-          cnpTxnCount:      salesCount,
-          tc15Count:        chargebackCount,
-          tc40Count:        fraudCount,
-          fraudAmountUSD:   null,
+          totalSalesCount:    salesCount,
+          totalSalesVolume:   grossVolume,
+          cnpTxnCount:        salesCount,        // total as CNP proxy (e-commerce merchant)
+          mastercardTxnCount: mastercardTxnCount, // precise ECP denominator
+          visaTxnCount:       visaTxnCount,       // informational
+          tc15Count:          chargebackCount,
+          tc40Count:          fraudCount,
+          fraudAmountUSD:     null,
+          statementPeriod:    statementPeriod,
         }
       : null,
     warnings,
     detectedFields: {
-      totalSalesVolume: grossVolume     !== null,
-      totalSalesCount:  salesCount      !== null,
-      cnpTxnCount:      salesCount      !== null,
-      tc15Count:        true,   // always resolved
-      tc40Count:        true,   // always 0
-      fraudAmountUSD:   false,
+      totalSalesVolume:   grossVolume        !== null,
+      totalSalesCount:    salesCount         !== null,
+      cnpTxnCount:        salesCount         !== null,
+      mastercardTxnCount: mastercardTxnCount !== null,
+      visaTxnCount:       visaTxnCount       !== null,
+      tc15Count:          true,   // always resolved
+      tc40Count:          true,   // always 0
+      fraudAmountUSD:     false,
+      statementPeriod:    statementPeriod    !== null,
     },
     isPDFExtracted: true,
   };
@@ -656,21 +790,27 @@ export async function parseStatements(files) {
         cnpTxnCount: data.cnpTxnCount ?? 0,
       });
 
+      // Month label: prefer extracted statementPeriod over filename detection
+      const periodLabel = data.statementPeriod || monthInfo?.month || file.name;
+
       return {
-        filename:         file.name,
-        month:            monthInfo?.month ?? file.name,
-        year:             monthInfo?.year  ?? null,
-        monthIndex:       monthInfo?.monthIndex ?? null,
-        isPDFExtracted:   Boolean(res.isPDFExtracted),
-        totalSalesCount:  data.totalSalesCount  ?? 0,
-        totalSalesVolume: data.totalSalesVolume ?? 0,
-        cnpTxnCount:      data.cnpTxnCount      ?? 0,
-        tc15Count:        data.tc15Count         ?? 0,
-        tc40Count:        data.tc40Count         ?? 0,
-        fraudAmountUSD:   data.fraudAmountUSD    ?? 0,
+        filename:           file.name,
+        month:              periodLabel,
+        year:               monthInfo?.year       ?? null,
+        monthIndex:         monthInfo?.monthIndex ?? null,
+        isPDFExtracted:     Boolean(res.isPDFExtracted),
+        totalSalesCount:    data.totalSalesCount    ?? 0,
+        totalSalesVolume:   data.totalSalesVolume   ?? 0,
+        cnpTxnCount:        data.cnpTxnCount        ?? 0,
+        mastercardTxnCount: data.mastercardTxnCount ?? null, // null = not extracted; 0 ≠ null
+        visaTxnCount:       data.visaTxnCount       ?? null,
+        tc15Count:          data.tc15Count          ?? 0,
+        tc40Count:          data.tc40Count          ?? 0,
+        fraudAmountUSD:     data.fraudAmountUSD     ?? 0,
+        statementPeriod:    data.statementPeriod    ?? null,
         vampRatio,
-        warnings:         res.warnings ?? [],
-        detectedFields:   res.detectedFields ?? {},
+        warnings:           res.warnings   ?? [],
+        detectedFields:     res.detectedFields ?? {},
       };
     })
   );
