@@ -1,14 +1,21 @@
 /**
- * Statement Parser — CSV + PDF Extraction Engine (v3)
+ * Statement Parser — CSV + PDF Extraction Engine (v4)
  *
  *  • CSV:  column-alias detection + null-vs-zero distinction.
  *  • PDF:  real text extraction via pdfjs-dist (browser-native, no server upload).
- *          First Data / ServeFirst statement rules:
- *            Gross Volume   → "Total Amount Submitted" (page 1 summary)
- *            Sales Count    → "Items" column in Summary By Card Type table
- *            Chargeback Cnt → 0 when "No Chargebacks/Reversals" phrase found;
- *                             never forces manual entry for this field
- *            Fraud Count    → always 0 (field absent in First Data statements)
+ *
+ *  Supported PDF statement formats:
+ *    1. First Data / ServeFirst / Fiserv
+ *         Gross Volume   → "Total Amount Submitted"
+ *         Sales Count    → "Items" column in "Summary By Card Type" table
+ *         Chargebacks    → 0 when "No Chargebacks/Reversals" or $0 on CB line
+ *         Fraud Count    → always 0 (not in First Data statements)
+ *    2. Chase Merchant Services / Paymentech / Chase Paymentech
+ *         Gross Volume   → "Gross Sales", "Total Sales", "Sales" row amount
+ *         Sales Count    → "Sales" row count OR "Total Transactions" label
+ *         Chargebacks    → "Chargebacks" row count in Activity Summary
+ *         Card Breakdown → "Card Type Summary" / "Sales By Card Type" section
+ *    3. Generic fallback — tries common label variants across both formats
  *
  * Privacy-first: all parsing is 100% client-side via FileReader / pdfjs Web Worker.
  * No data is uploaded or stored on any server.
@@ -483,6 +490,319 @@ function parseFirstDataFields(lines) {
     isPDFExtracted: true,
   };
 }
+// ── Statement format detection ─────────────────────────────────────────────
+
+/**
+ * Examine the first ~60 lines of extracted PDF text to identify the statement
+ * issuer / processor format.
+ *
+ * Returns: 'firstdata' | 'chase' | 'unknown'
+ *
+ * Markers are lowercased substrings that definitively identify a format.
+ */
+const FIRSTDATA_MARKERS = [
+  'total amount submitted',
+  'summary by card type',
+  'servefirst',
+  'first data',
+  'fiserv',
+  'fd merchant',
+];
+
+const CHASE_MARKERS = [
+  'paymentech',
+  'chase merchant',
+  'chase paymentech',
+  'jpmorgan chase',
+  'j.p. morgan',
+  'summary of activity',
+  'monthly activity summary',
+  'card type summary',
+  'sales by card type',
+  'chase.com/merchant',
+];
+
+function detectStatementFormat(lines) {
+  // Only scan first 80 lines — format markers appear in headers / first section
+  const sample = lines.slice(0, 80).join('\n').toLowerCase();
+
+  const hasFirstData = FIRSTDATA_MARKERS.some((m) => sample.includes(m));
+  const hasChase     = CHASE_MARKERS.some((m) => sample.includes(m));
+
+  if (hasFirstData && !hasChase) return 'firstdata';
+  if (hasChase && !hasFirstData) return 'chase';
+  if (hasFirstData) return 'firstdata';  // both → prefer First Data (more specific markers)
+  return 'unknown';
+}
+
+// ── Chase Merchant Services / Paymentech field extraction ─────────────────
+
+/**
+ * Chase-specific gross volume label variants.
+ * These are matched anywhere in a line (lower-cased), NOT at start.
+ */
+const CHASE_GROSS_LABELS = [
+  'gross sales',
+  'total gross sales',
+  'total sales',
+  'total gross',
+  'gross amount',
+  'total processed volume',
+  'total processing volume',
+  'total amount processed',
+  'sales volume',
+  'gross volume',
+  'net sales',          // some Chase formats show "Net Sales" as the deposit base
+];
+
+/**
+ * Chase-specific transaction-count label variants.
+ */
+const CHASE_COUNT_LABELS = [
+  'total transactions',
+  'total items',
+  'total transaction count',
+  'number of transactions',
+  'transaction count',
+];
+
+/**
+ * Parse extracted PDF lines using Chase Merchant Services / Paymentech rules.
+ *
+ * Field rules:
+ *  • Gross Volume        "Gross Sales", "Total Sales", or "Sales" row amount
+ *  • Sales Count         "Sales" row count OR "Total Transactions" label
+ *  • mastercardTxnCount  Mastercard row in card-type section
+ *  • visaTxnCount        Visa row in card-type section
+ *  • Chargeback Cnt      "Chargebacks" row in Activity Summary (count, or 0 if $0.00)
+ *  • Fraud Count         0 (not reported on Chase merchant statements)
+ *  • statementPeriod     From date-range patterns or "Month YYYY"
+ *
+ * @param {string[]} lines
+ * @returns {{ data: object, warnings: string[], detectedFields: object }}
+ */
+function parseChaseFields(lines) {
+  const warnings = [];
+
+  let grossVolume     = null;
+  let salesCount      = null;
+  let chargebackCount = null;
+  const fraudCount    = 0;
+
+  let mcCardSum    = 0;
+  let visaCardSum  = 0;
+  let mcCardFound  = false;
+  let visaCardFound = false;
+
+  let statementPeriod  = null;
+  let inCardSection    = false;
+  let inSummarySection = false;
+  let cbSectionFound   = false;
+
+  // Accumulated card-section totals for fallback salesCount
+  let cardSectionTotal = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line  = lines[i];
+    const lower = line.toLowerCase().trim();
+
+    // ── 0. Statement period ────────────────────────────────────────────
+    if (statementPeriod === null) {
+      statementPeriod = extractPeriodFromLine(line);
+    }
+
+    // ── 1. Section boundaries ──────────────────────────────────────────
+
+    // Activity / Summary section start
+    if (lower.includes('summary of activity') || lower.includes('activity summary') ||
+        lower.includes('monthly summary')     || lower.includes('monthly activity')) {
+      inSummarySection = true;
+      inCardSection    = false;
+      continue;
+    }
+
+    // Card-type section start — "card type summary", "sales by card type",
+    // "card type detail", "card type breakdown", "by card type"
+    if (lower.includes('card type') || lower.includes('by card type') ||
+        lower.includes('sales by card')) {
+      inCardSection    = true;
+      inSummarySection = false;
+      cardSectionTotal = 0;
+      continue;
+    }
+
+    // ── 2. Gross Volume — explicit labels ──────────────────────────────
+    if (grossVolume === null && CHASE_GROSS_LABELS.some((lbl) => lower.includes(lbl))) {
+      let val = firstDollar(line);
+      if (val === null && i + 1 < lines.length) val = firstDollar(lines[i + 1]);
+      if (val !== null && val > 0) grossVolume = val;
+    }
+
+    // ── 3. "No Chargebacks" phrase (some Chase formats share this wording) ──
+    if (chargebackCount === null && NO_CB_PHRASES.some((p) => lower.includes(p))) {
+      chargebackCount = 0;
+    }
+
+    // ── 4. "Sales" row in activity summary (Chase canonical format) ────
+    // Chase activity summary rows look like: "Sales   1,234  $123,456.78"
+    // We want the row whose first token is exactly "sales" (not "gross sales",
+    // "net sales", "total sales" — those are caught above).
+    if (grossVolume === null &&
+        (lower === 'sales' || /^sales\s/.test(lower)) &&
+        !lower.includes('gross') && !lower.includes('net') &&
+        !lower.includes('card') && !lower.includes('by')) {
+      let val = firstDollar(line);
+      let cnt = firstInt(line);
+      // Look ahead up to 2 lines (some PDFs split count and amount across lines)
+      if (val === null && i + 1 < lines.length) {
+        val = val ?? firstDollar(lines[i + 1]);
+        cnt = cnt ?? firstInt(lines[i + 1]);
+      }
+      if (val === null && i + 2 < lines.length) {
+        val = val ?? firstDollar(lines[i + 2]);
+        cnt = cnt ?? firstInt(lines[i + 2]);
+      }
+      if (val !== null && val > 0) {
+        grossVolume = val;
+        if (cnt !== null && cnt > 0 && salesCount === null) salesCount = cnt;
+      }
+    }
+
+    // ── 5. Transaction count — explicit label ──────────────────────────
+    if (salesCount === null && CHASE_COUNT_LABELS.some((lbl) => lower.includes(lbl))) {
+      let cnt = firstInt(line);
+      if (cnt === null && i + 1 < lines.length) cnt = firstInt(lines[i + 1]);
+      if (cnt !== null && cnt > 0) salesCount = cnt;
+    }
+
+    // ── 6. Chargebacks ─────────────────────────────────────────────────
+    // Chase shows "Chargebacks  2  ($234.56)" in the activity summary,
+    // or "Chargebacks and Retrievals  3  ($345.00)".
+    if (chargebackCount === null && lower.includes('chargeback')) {
+      cbSectionFound = true;
+      const cnt    = firstInt(line);
+      const dollar = firstDollar(line);
+
+      if (cnt !== null) {
+        chargebackCount = cnt;   // could be 0 if "$0.00" line has no integer count
+      } else if (dollar === 0) {
+        chargebackCount = 0;
+      } else if (i + 1 < lines.length) {
+        // count may appear on the very next line (split layout)
+        const nextCnt = firstInt(lines[i + 1]);
+        if (nextCnt !== null) chargebackCount = nextCnt;
+      }
+    }
+
+    // ── 7. Card-type section rows ──────────────────────────────────────
+    if (inCardSection) {
+      // Section end: "Total" row or fee / batch summary headers
+      const sectionEnds =
+        lower.includes('fee detail')        ||
+        lower.includes('discount detail')   ||
+        lower.includes('interchange detail') ||
+        lower.includes('summary by batch')  ||
+        lower.includes('adjustment detail') ||
+        (lower.startsWith('page ') && /page\s+\d+/i.test(lower));
+
+      if (sectionEnds) {
+        inCardSection = false;
+        continue;
+      }
+
+      // Skip column header rows ("count", "amount", "transactions", "items")
+      if (/^\s*(count|amount|transactions|items|card type|type)\s*$/i.test(lower)) continue;
+
+      // "Total" row → use for salesCount fallback
+      if (/^\s*total\b/i.test(lower)) {
+        const cnt = firstInt(line);
+        if (cnt !== null && cnt > 0 && salesCount === null) salesCount = cnt;
+        inCardSection = false;
+        continue;
+      }
+
+      // Card-brand rows
+      const isMC   = lower.startsWith('mastercard') || lower.startsWith('master card') ||
+                     (lower.startsWith('mc') && !lower.startsWith('misc'));
+      const isVisa = lower.startsWith('visa');
+
+      if (isMC || isVisa || CARD_TYPE_PREFIXES.some((p) => lower.startsWith(p))) {
+        const cnt = firstInt(line);
+        if (cnt !== null && cnt > 0) {
+          cardSectionTotal += cnt;
+          if (isMC)   { mcCardSum  += cnt; mcCardFound  = true; }
+          if (isVisa) { visaCardSum += cnt; visaCardFound = true; }
+        }
+      }
+    }
+  }
+
+  // ── Post-loop resolution ───────────────────────────────────────────────
+
+  // salesCount fallback: accumulated card-section rows
+  if (salesCount === null && cardSectionTotal > 0) {
+    salesCount = cardSectionTotal;
+    warnings.push(
+      'Sales count derived from card-type rows. Verify against statement total if multiple card types.'
+    );
+  }
+
+  // Per-brand counts
+  const mastercardTxnCount = mcCardFound  && mcCardSum  > 0 ? mcCardSum  : null;
+  const visaTxnCount       = visaCardFound && visaCardSum > 0 ? visaCardSum : null;
+
+  // Chargebacks: default 0 when section was found but count was ambiguous
+  if (chargebackCount === null) {
+    chargebackCount = 0;
+    warnings.push(
+      cbSectionFound
+        ? 'Chargeback row found but count could not be extracted. Defaulted to 0 — please verify.'
+        : 'Chargeback row not found in PDF. Defaulted to 0.'
+    );
+  }
+
+  if (grossVolume === null) {
+    warnings.push('"Gross Sales" / "Total Sales" not found in PDF. Please enter Gross Volume manually.');
+  }
+  if (salesCount === null) {
+    warnings.push('Transaction count not found in PDF. Please enter Sales Count manually.');
+  }
+  if (mastercardTxnCount === null) {
+    warnings.push('Mastercard transaction count not found in PDF. Enter it manually for a precise ECP calculation.');
+  }
+
+  const anyExtracted = grossVolume !== null || salesCount !== null;
+
+  return {
+    data: anyExtracted
+      ? {
+          totalSalesCount:    salesCount,
+          totalSalesVolume:   grossVolume,
+          cnpTxnCount:        salesCount,
+          mastercardTxnCount,
+          visaTxnCount,
+          tc15Count:          chargebackCount,
+          tc40Count:          fraudCount,
+          fraudAmountUSD:     null,
+          statementPeriod,
+        }
+      : null,
+    warnings,
+    detectedFields: {
+      totalSalesVolume:   grossVolume        !== null,
+      totalSalesCount:    salesCount         !== null,
+      cnpTxnCount:        salesCount         !== null,
+      mastercardTxnCount: mastercardTxnCount !== null,
+      visaTxnCount:       visaTxnCount       !== null,
+      tc15Count:          true,
+      tc40Count:          true,
+      fraudAmountUSD:     false,
+      statementPeriod:    statementPeriod    !== null,
+    },
+    isPDFExtracted: true,
+  };
+}
+
 import { calculateMonthlyVAMP, formatMonthLabel } from './trendCalculator.js';
 
 // ── Column-name aliases ────────────────────────────────────────────────────
@@ -731,6 +1051,22 @@ export function parseCSVStatement(file) {
  * @param {File} file
  * @returns {Promise<object>}
  */
+/**
+ * Count how many core numeric fields were successfully extracted.
+ * Used to pick the better result when format is ambiguous.
+ */
+function countExtracted(result) {
+  if (!result?.data) return 0;
+  const d = result.data;
+  return [
+    d.totalSalesVolume,
+    d.totalSalesCount,
+    d.tc15Count !== null,
+    d.mastercardTxnCount,
+    d.statementPeriod,
+  ].filter(Boolean).length;
+}
+
 export async function parsePDFStatement(file) {
   try {
     const lines = await extractPDFLines(file);
@@ -749,14 +1085,34 @@ export async function parsePDFStatement(file) {
       };
     }
 
-    const result = parseFirstDataFields(lines);
+    // ── Format detection + dispatch ────────────────────────────────────────
+    const format = detectStatementFormat(lines);
+
+    let result;
+
+    if (format === 'firstdata') {
+      result = parseFirstDataFields(lines);
+    } else if (format === 'chase') {
+      result = parseChaseFields(lines);
+    } else {
+      // Unknown format — try both, keep the one that extracted more fields
+      const fd    = parseFirstDataFields(lines);
+      const chase = parseChaseFields(lines);
+      result = countExtracted(fd) >= countExtracted(chase) ? fd : chase;
+      if (result.data) {
+        result.warnings.unshift(
+          'Statement format not definitively identified — auto-detected best match. ' +
+          'Please verify extracted figures against your statement.'
+        );
+      }
+    }
 
     return {
       data:               result.data,
       warnings:           result.warnings,
       detectedFields:     result.detectedFields,
       isPDFExtracted:     true,
-      // requiresManualEntry only when nothing at all could be extracted
+      detectedFormat:     format,
       requiresManualEntry: result.data === null,
       notice: result.data === null
         ? 'Some required fields could not be found automatically in this PDF. ' +
